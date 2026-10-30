@@ -165,7 +165,27 @@ async function init() {
       expires_at timestamptz NOT NULL,
       completed_at timestamptz
     )`;
+    await q`ALTER TABLE game_challenges ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb`;
     await q`CREATE INDEX IF NOT EXISTS game_challenges_user_idx ON game_challenges(user_id, created_at DESC)`;
+
+    await q`CREATE TABLE IF NOT EXISTS game_matches (
+      id serial PRIMARY KEY,
+      game text NOT NULL CHECK (game IN ('cookie','guess')),
+      creator_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      opponent_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','completed','rejected')),
+      creator_score int NOT NULL DEFAULT 0,
+      opponent_score int NOT NULL DEFAULT 0,
+      secret_number int,
+      turn_user_id int REFERENCES users(id),
+      winner_id int REFERENCES users(id),
+      settled boolean NOT NULL DEFAULT false,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      started_at timestamptz,
+      ends_at timestamptz
+    )`;
+    await q`CREATE INDEX IF NOT EXISTS game_matches_creator_idx ON game_matches(creator_id,status,created_at DESC)`;
+    await q`CREATE INDEX IF NOT EXISTS game_matches_opponent_idx ON game_matches(opponent_id,status,created_at DESC)`;
 
     await q`CREATE TABLE IF NOT EXISTS market_listings (
       id serial PRIMARY KEY,
@@ -258,7 +278,7 @@ async function getMe(id) {
     businessClaimAt: u.business_claim_at,
     cars: ownedCars.map(car => ({ id: car.id, name: car.name, value: Number(car.value) })),
     cd: {
-      daily: u.stam ? 0 : Number(u.c_daily || 0),
+      daily: Number(u.c_daily || 0),
       focus: u.stam ? 0 : Number(u.c_focus || 0),
       run: Number(u.focus_run || 0),
       pending: Boolean(u.focus_pending)
@@ -282,6 +302,23 @@ async function createSession(userId) {
 }
 
 const passwordHash = (password, salt) => scryptSync(password, salt, 32).toString('hex');
+
+async function settleExpiredMatch(q, matchId) {
+  const rows = await q`WITH done AS (
+    UPDATE game_matches SET
+      status='completed',
+      winner_id=CASE
+        WHEN game='cookie' AND creator_score>opponent_score THEN creator_id
+        WHEN game='cookie' AND opponent_score>creator_score THEN opponent_id
+        ELSE NULL END,
+      settled=true
+    WHERE id=${matchId} AND status='active' AND settled=false AND ends_at IS NOT NULL AND ends_at<=now()
+    RETURNING winner_id
+  ), reward AS (
+    UPDATE users SET ok=ok+5 WHERE id=(SELECT winner_id FROM done) RETURNING id
+  ) SELECT winner_id FROM done`;
+  return rows[0] || null;
+}
 
 const CAR_CATALOG = (Array.isArray(D.cars) ? D.cars : []).map(car => ({
   name: String(car.name),
@@ -369,7 +406,7 @@ const Actions = {
       ok = ok + ${current.role === 'owner' || current.role === 'admin' ? 0 : 1},
       daily_at = now()
       WHERE id = ${userId}
-        AND (stam OR daily_at IS NULL OR daily_at <= now() - interval '24 hours')
+        AND (daily_at IS NULL OR daily_at <= now() - interval '24 hours')
       RETURNING id`;
     if (!updated.length) throw new E('⏳ Щоденний бонус ще недоступний');
     return { reward, me: await getMe(userId) };
@@ -473,10 +510,10 @@ const Actions = {
   async gamesStart(userId, payload) {
     const q = await getSql();
     const game = String(payload.game || '');
-    if (!['math','memory','number'].includes(game)) throw new E('Невідома мінігра');
-    const recent = await q`SELECT id FROM game_challenges WHERE user_id = ${userId} AND created_at > now() - interval '20 seconds' LIMIT 1`;
-    if (recent.length) throw new E('Зроби коротку перерву перед наступною грою');
-    let answer = '', prompt = '';
+    if (!['math','memory','number','coin','roulette'].includes(game)) throw new E('Невідома мінігра');
+    const recent = await q`SELECT id FROM game_challenges WHERE user_id = ${userId} AND created_at > now() - interval '2 seconds' LIMIT 1`;
+    if (recent.length) throw new E('Зроби коротку паузу перед наступним раундом');
+    let answer = '', prompt = '', metadata = {}, seconds = 120;
     if (game === 'math') {
       const a = randomInt(4, 31), b = randomInt(3, 19), op = ['+','-','×'][randomInt(0,3)];
       const left = op === '-' ? Math.max(a,b) : a;
@@ -487,27 +524,155 @@ const Actions = {
       const sequence = Array.from({length:6},()=>String(randomInt(0,10))).join('');
       answer = sequence;
       prompt = sequence;
-    } else {
+      seconds = 4;
+    } else if (game === 'number') {
       answer = String(randomInt(1,21));
       prompt = 'Вгадай число від 1 до 20';
+    } else if (game === 'coin') {
+      const prediction = String(payload.prediction || '');
+      if (!['heads','tails'].includes(prediction)) throw new E('Обери орла або решку перед кидком');
+      answer = randomInt(0,2) ? 'heads' : 'tails';
+      prompt = '50/50';
+      metadata = { prediction };
+      seconds = 45;
+    } else if (game === 'roulette') {
+      const level = int(payload.level, 1, 4, 'Обери рівень рулетки від 1 до 4');
+      const prediction = String(payload.prediction ?? '').trim().toLowerCase();
+      const valid = level===1 ? ['red','black'].includes(prediction)
+        : level===2 ? ['even','odd'].includes(prediction)
+        : level===3 ? ['low','high'].includes(prediction)
+        : /^([0-9]|[1-2][0-9]|3[0-6])$/.test(prediction);
+      if (!valid) throw new E('Перевір вибір для цього рівня рулетки');
+      answer = String(randomInt(0,37));
+      prompt = '0–36';
+      metadata = { level, prediction };
+      seconds = 60;
     }
-    const [row] = await q`INSERT INTO game_challenges(user_id, game, answer, prompt, expires_at)
-      VALUES(${userId}, ${game}, ${answer}, ${prompt}, now() + interval '2 minutes') RETURNING id`;
-    return { challenge: { id: row.id, game, prompt, seconds: game === 'memory' ? 4 : 120 } };
+    const [row] = await q`INSERT INTO game_challenges(user_id, game, answer, prompt, metadata, expires_at)
+      VALUES(${userId}, ${game}, ${answer}, ${prompt}, ${JSON.stringify(metadata)}::jsonb, now() + interval '2 minutes') RETURNING id`;
+    return { challenge: { id: row.id, game, prompt, seconds, level: metadata.level || null } };
   },
 
   async gamesFinish(userId, payload) {
     const q = await getSql();
     const id = int(payload.id, 1, 2_000_000_000, 'Завдання не знайдено');
-    const submitted = String(payload.answer ?? '').trim().replace(/\s+/g,'');
+    const submitted = String(payload.answer ?? '').trim().replace(/\s+/g,'').toLowerCase();
     const [challenge] = await q`UPDATE game_challenges SET completed_at = now()
       WHERE id = ${id} AND user_id = ${userId} AND completed_at IS NULL AND expires_at > now()
-      RETURNING game, answer`;
+      RETURNING game, answer, prompt, metadata`;
     if (!challenge) throw new E('Завдання вже використане або час вийшов');
-    const correct = submitted.toLocaleLowerCase('uk-UA') === String(challenge.answer).toLocaleLowerCase('uk-UA');
-    const points = correct ? ({math:5,memory:6,number:4}[challenge.game] || 0) : 0;
+    const meta = typeof challenge.metadata === 'string' ? JSON.parse(challenge.metadata || '{}') : (challenge.metadata || {});
+    let correct = submitted === String(challenge.answer).toLowerCase();
+    let points = 0;
+    let result = {};
+    if (challenge.game === 'coin') {
+      correct = String(meta.prediction) === String(challenge.answer);
+      points = correct ? 2 : 0;
+      result = { side: challenge.answer, prediction: meta.prediction };
+    } else if (challenge.game === 'roulette') {
+      const n = Number(challenge.answer), level = Number(meta.level), prediction = String(meta.prediction);
+      const reds = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+      const color = n===0 ? 'green' : (reds.has(n) ? 'red' : 'black');
+      const outcome = level===1 ? color : level===2 ? (n===0?'zero':(n%2?'odd':'even')) : level===3 ? (n===0?'zero':(n<=18?'low':'high')) : String(n);
+      correct = prediction === outcome;
+      points = correct ? ({1:2,2:3,3:5,4:8}[level] || 0) : 0;
+      result = { number:n, color, outcome, level, prediction };
+    } else {
+      points = correct ? ({math:5,memory:6,number:4}[challenge.game] || 0) : 0;
+    }
     if (points) await q`UPDATE users SET ok = ok + ${points} WHERE id = ${userId}`;
-    return { correct, points, me: await getMe(userId) };
+    return { correct, points, result, me: await getMe(userId) };
+  },
+
+  async matchCreate(userId, payload) {
+    const q = await getSql();
+    const game = String(payload.game || '');
+    if (!['cookie','guess'].includes(game)) throw new E('Невідомий тип матчу');
+    const nick = String(payload.nick || '').trim().toLocaleLowerCase('uk-UA');
+    if (!nick) throw new E('Вкажи нік суперника');
+    const [opponent] = await q`SELECT id,nick FROM users WHERE nick_lc=${nick} AND id<>${userId}`;
+    if (!opponent) throw new E('Гравця не знайдено');
+    await q`UPDATE game_matches SET status='rejected' WHERE status='pending' AND created_at < now()-interval '24 hours' AND (creator_id=${userId} OR opponent_id=${userId})`;
+    const [existing] = await q`SELECT id FROM game_matches WHERE status IN ('pending','active') AND (creator_id=${userId} OR opponent_id=${userId} OR creator_id=${opponent.id} OR opponent_id=${opponent.id}) LIMIT 1`;
+    if (existing) throw new E('Один із гравців уже має незавершений матч');
+    const [row] = await q`INSERT INTO game_matches(game,creator_id,opponent_id)
+      VALUES(${game},${userId},${opponent.id}) RETURNING id`;
+    await q`INSERT INTO inbox(user_id,sender,message) VALUES(${opponent.id},'AFK Games',${`Гравець запросив тебе в ${game==='cookie'?'Печеньку':'Вгадай число'} · матч №${row.id}. Відкрий розділ Мініігри, щоб відповісти.`})`;
+    return { id:row.id, opponent:opponent.nick };
+  },
+
+  async matchRespond(userId, payload) {
+    const q = await getSql();
+    const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
+    const action = String(payload.action || '');
+    if (!['accept','reject'].includes(action)) throw new E('Невідома дія');
+    if (action === 'reject') {
+      const rows=await q`UPDATE game_matches SET status='rejected' WHERE id=${id} AND opponent_id=${userId} AND status='pending' RETURNING creator_id`;
+      if (!rows.length) throw new E('Запрошення вже оброблено');
+      await q`INSERT INTO inbox(user_id,sender,message) VALUES(${rows[0].creator_id},'AFK Games',${`Запрошення в матч №${id} відхилено.`})`;
+      return { ok:true };
+    }
+    const rows=await q`UPDATE game_matches SET status='active',started_at=now(),
+        ends_at=CASE WHEN game='cookie' THEN now()+interval '60 seconds' ELSE now()+interval '10 minutes' END,
+        secret_number=CASE WHEN game='guess' THEN floor(random()*30)::int+1 ELSE NULL END,
+        turn_user_id=CASE WHEN game='guess' THEN creator_id ELSE NULL END
+      WHERE id=${id} AND opponent_id=${userId} AND status='pending'
+      RETURNING creator_id,opponent_id,game,ends_at`;
+    if (!rows.length) throw new E('Запрошення вже оброблено');
+    await q`INSERT INTO inbox(user_id,sender,message) VALUES(${rows[0].creator_id},'AFK Games',${`Матч №${id} прийнято. Гра почалася!`})`;
+    return { ok:true, game:rows[0].game, endsAt:rows[0].ends_at };
+  },
+
+  async matchList(userId) {
+    const q = await getSql();
+    await q`UPDATE game_matches SET status='rejected' WHERE status='pending' AND created_at < now()-interval '24 hours' AND (creator_id=${userId} OR opponent_id=${userId})`;
+    const expired = await q`SELECT id FROM game_matches WHERE status='active' AND ends_at<=now() AND (creator_id=${userId} OR opponent_id=${userId})`;
+    for (const row of expired) await settleExpiredMatch(q,row.id);
+    const rows = await q`SELECT m.*,c.nick AS creator,o.nick AS opponent,w.nick AS winner
+      FROM game_matches m JOIN users c ON c.id=m.creator_id JOIN users o ON o.id=m.opponent_id
+      LEFT JOIN users w ON w.id=m.winner_id
+      WHERE (m.creator_id=${userId} OR m.opponent_id=${userId})
+      ORDER BY m.created_at DESC LIMIT 30`;
+    return { me: await getMe(userId), matches:rows.map(m=>({
+      id:m.id,game:m.game,status:m.status,creator:m.creator,opponent:m.opponent,winner:m.winner,
+      incoming:Number(m.opponent_id)===userId,creatorMe:Number(m.creator_id)===userId,
+      creatorScore:Number(m.creator_score),opponentScore:Number(m.opponent_score),
+      myScore:Number(m.creator_id)===userId?Number(m.creator_score):Number(m.opponent_score),
+      otherScore:Number(m.creator_id)===userId?Number(m.opponent_score):Number(m.creator_score),
+      myTurn:Number(m.turn_user_id)===userId,endsAt:m.ends_at,
+      ended:m.status==='completed',secretFound:Boolean(m.winner_id)
+    }))};
+  },
+
+  async cookieTap(userId, payload) {
+    const q = await getSql();
+    const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
+    const rows=await q`UPDATE game_matches SET
+        creator_score=creator_score+CASE WHEN creator_id=${userId} THEN 1 ELSE 0 END,
+        opponent_score=opponent_score+CASE WHEN opponent_id=${userId} THEN 1 ELSE 0 END
+      WHERE id=${id} AND status='active' AND ends_at>now() AND (creator_id=${userId} OR opponent_id=${userId})
+      RETURNING creator_score,opponent_score`;
+    if(!rows.length) throw new E('Матч завершено або ти не є його учасником');
+    return { creatorScore:Number(rows[0].creator_score),opponentScore:Number(rows[0].opponent_score) };
+  },
+
+  async guessMatch(userId, payload) {
+    const q = await getSql();
+    const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
+    const guess = int(payload.guess,1,30,'Введи число від 1 до 30');
+    const rows=await q`UPDATE game_matches SET
+        status=CASE WHEN secret_number=${guess} THEN 'completed' ELSE status END,
+        winner_id=CASE WHEN secret_number=${guess} THEN ${userId} ELSE NULL END,
+        settled=CASE WHEN secret_number=${guess} THEN true ELSE settled END,
+        turn_user_id=CASE WHEN secret_number=${guess} THEN turn_user_id
+          WHEN turn_user_id=creator_id THEN opponent_id ELSE creator_id END
+      WHERE id=${id} AND game='guess' AND status='active' AND ends_at>now()
+        AND turn_user_id=${userId} AND (creator_id=${userId} OR opponent_id=${userId})
+      RETURNING secret_number,status,turn_user_id`;
+    if(!rows.length) throw new E('Зараз не твій хід або матч уже завершено');
+    const row=rows[0],won=row.status==='completed';
+    if(won) await q`UPDATE users SET ok=ok+5 WHERE id=${userId}`;
+    return { won, hint:won?'correct':guess<Number(row.secret_number)?'higher':'lower', myTurn:Number(row.turn_user_id)===userId, me:await getMe(userId) };
   },
 
   async businessClaim(userId) {
@@ -887,7 +1052,7 @@ export default async function handler(request) {
   try {
     if (request.method === 'GET') {
       await init();
-      return J({ ok: true, database: databaseKind, version: '3.0.0' });
+      return J({ ok: true, database: databaseKind, version: '4.0.0' });
     }
     if (request.method !== 'POST') return J({ err: 'Метод не підтримується' }, 405);
 
