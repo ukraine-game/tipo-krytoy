@@ -1,6 +1,6 @@
 {
   "name": "afk-bank",
-  "version": "4.0.0",
+  "version": "6.0.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@netlify/database": "latest",
-    "@netlify/neon": "latest"
+    "@netlify/neon": "latest",
+    "web-push": "latest"
   }
 }
