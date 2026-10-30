@@ -9,8 +9,8 @@ self.addEventListener('push', (event) => {
     body: String(payload.body || 'У тебе нове сповіщення.').slice(0, 240),
     icon: '/assets/icon-192.png',
     badge: '/assets/icon-192.png',
-    tag: 'afk-bank-notice',
-    renotify: false,
+    tag: typeof payload.tag === 'string' ? payload.tag.slice(0,120) : 'afk-bank-notice',
+    renotify: true,
     data: { url: typeof payload.url === 'string' && payload.url.startsWith('/') ? payload.url : '/' }
   };
   event.waitUntil(self.registration.showNotification(title, options));
