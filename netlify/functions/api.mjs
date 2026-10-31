@@ -11,6 +11,8 @@ const SESSION_DAYS = 30;
 const FOCUS_MS = 30_000;
 const FOCUS_COOLDOWN_HOURS = 2;
 const GAME_COOLDOWN_SECONDS = 20;
+const GAME_STAKE_MIN = 10;
+const GAME_STAKE_MAX = 1_000_000;
 const ROLE_CREATE_COST = 200_000;
 const BANK_MIN = 1_000;
 const BANK_MAX = 2_000_000_000;
@@ -192,6 +194,7 @@ async function init() {
     await q`ALTER TABLE game_matches ADD CONSTRAINT game_matches_status_check CHECK (status IN ('pending','choosing','active','completed','rejected'))`;
     await q`ALTER TABLE game_matches ADD COLUMN IF NOT EXISTS creator_secret int`;
     await q`ALTER TABLE game_matches ADD COLUMN IF NOT EXISTS opponent_secret int`;
+    await q`ALTER TABLE game_matches ADD COLUMN IF NOT EXISTS stake bigint NOT NULL DEFAULT 0`;
     await q`CREATE INDEX IF NOT EXISTS game_matches_creator_idx ON game_matches(creator_id,status,created_at DESC)`;
     await q`CREATE INDEX IF NOT EXISTS game_matches_opponent_idx ON game_matches(opponent_id,status,created_at DESC)`;
     await q`CREATE TABLE IF NOT EXISTS solo_guess_sessions (
@@ -208,7 +211,56 @@ async function init() {
       expires_at timestamptz NOT NULL,
       completed_at timestamptz
     )`;
+    await q`ALTER TABLE solo_guess_sessions ADD COLUMN IF NOT EXISTS stake bigint NOT NULL DEFAULT 0`;
+    await q`ALTER TABLE solo_guess_sessions ADD COLUMN IF NOT EXISTS payout_multiplier numeric(4,2) NOT NULL DEFAULT 1.00`;
     await q`CREATE INDEX IF NOT EXISTS solo_guess_user_idx ON solo_guess_sessions(user_id,created_at DESC)`;
+
+    await q`CREATE TABLE IF NOT EXISTS blackjack_sessions (
+      id serial PRIMARY KEY,
+      mode text NOT NULL CHECK (mode IN ('solo','friend')),
+      creator_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      opponent_id int REFERENCES users(id) ON DELETE CASCADE,
+      stake bigint NOT NULL CHECK (stake >= 10),
+      status text NOT NULL DEFAULT 'active' CHECK (status IN ('pending','active','completed','rejected','expired')),
+      state jsonb NOT NULL,
+      version int NOT NULL DEFAULT 0,
+      payout_creator bigint NOT NULL DEFAULT 0,
+      payout_opponent bigint NOT NULL DEFAULT 0,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      completed_at timestamptz
+    )`;
+    await q`CREATE INDEX IF NOT EXISTS blackjack_creator_idx ON blackjack_sessions(creator_id,status,created_at DESC)`;
+    await q`CREATE INDEX IF NOT EXISTS blackjack_opponent_idx ON blackjack_sessions(opponent_id,status,created_at DESC)`;
+    await q`CREATE UNIQUE INDEX IF NOT EXISTS blackjack_solo_one_active_idx ON blackjack_sessions(creator_id) WHERE mode='solo' AND status='active'`;
+    await q`CREATE UNIQUE INDEX IF NOT EXISTS blackjack_friend_creator_open_idx ON blackjack_sessions(creator_id) WHERE mode='friend' AND status IN ('pending','active')`;
+    await q`CREATE UNIQUE INDEX IF NOT EXISTS blackjack_friend_opponent_open_idx ON blackjack_sessions(opponent_id) WHERE mode='friend' AND status IN ('pending','active')`;
+
+    await q`CREATE TABLE IF NOT EXISTS mines_sessions (
+      id serial PRIMARY KEY,
+      user_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      stake bigint NOT NULL CHECK (stake >= 10),
+      bomb_count int NOT NULL CHECK (bomb_count IN (3,5,10,20)),
+      state jsonb NOT NULL,
+      version int NOT NULL DEFAULT 0,
+      status text NOT NULL DEFAULT 'active' CHECK (status IN ('active','won','lost','expired')),
+      payout bigint NOT NULL DEFAULT 0,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      expires_at timestamptz NOT NULL,
+      completed_at timestamptz
+    )`;
+    await q`CREATE INDEX IF NOT EXISTS mines_user_idx ON mines_sessions(user_id,status,created_at DESC)`;
+    await q`CREATE UNIQUE INDEX IF NOT EXISTS mines_one_active_per_user_idx ON mines_sessions(user_id) WHERE status='active'`;
+
+    await q`CREATE TABLE IF NOT EXISTS slot_spins (
+      id serial PRIMARY KEY,
+      user_id int NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      stake bigint NOT NULL,
+      payout bigint NOT NULL DEFAULT 0,
+      result jsonb NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`;
+    await q`CREATE INDEX IF NOT EXISTS slot_spins_user_idx ON slot_spins(user_id,created_at DESC)`;
 
     await q`CREATE TABLE IF NOT EXISTS market_listings (
       id serial PRIMARY KEY,
@@ -567,6 +619,19 @@ async function scheduledMaintenance() {
   await init(); const q=await getSql();
   // Handle election and game boundaries before per-user maintenance.
   await refreshPolitics(q);
+  await q`WITH expired AS (
+    UPDATE game_matches SET status='rejected',settled=true
+    WHERE status='pending' AND settled=false AND created_at<now()-interval '24 hours'
+    RETURNING creator_id,stake
+  ), refund AS (
+    UPDATE users SET bal=users.bal+expired.stake
+    FROM expired WHERE users.id=expired.creator_id
+    RETURNING users.id
+  ) SELECT COUNT(*)::int AS refunded FROM refund`;
+  await settleExpiredSoloGuesses(q);
+  await settleExpiredCoinWagers(q);
+  await expireBlackjackSessions(q,null);
+  await settleExpiredMines(q,null);
   const expiredMatches=await q`SELECT id FROM game_matches WHERE status IN ('choosing','active') AND settled=false AND ends_at IS NOT NULL AND ends_at<=now() ORDER BY id LIMIT 250`;
   for(const match of expiredMatches) await settleExpiredMatch(q,match.id);
   const users=await q`SELECT id FROM users WHERE id>0 ORDER BY id`;
@@ -643,6 +708,62 @@ async function createSession(userId) {
 
 const passwordHash = (password, salt) => scryptSync(password, salt, 32).toString('hex');
 
+async function settleExpiredPendingMatches(q, firstUserId, secondUserId=firstUserId) {
+  await q`WITH expired AS (
+    UPDATE game_matches SET status='rejected',settled=true
+    WHERE status='pending' AND settled=false
+      AND created_at < now()-interval '24 hours'
+      AND (creator_id IN (${firstUserId},${secondUserId}) OR opponent_id IN (${firstUserId},${secondUserId}))
+    RETURNING creator_id,stake
+  ), refund AS (
+    UPDATE users SET bal=users.bal+expired.stake
+    FROM expired WHERE users.id=expired.creator_id
+    RETURNING users.id
+  ) SELECT COUNT(*)::int AS refunded FROM refund`;
+}
+
+async function settleExpiredCoinWagers(q, userId=null) {
+  await q`WITH expired AS (
+    UPDATE game_challenges SET completed_at=now()
+    WHERE game='coin' AND completed_at IS NULL AND expires_at<=now()
+      AND metadata->>'stake' IS NOT NULL
+      AND (${userId}::int IS NULL OR user_id=${userId})
+    RETURNING user_id,metadata
+  ), refund AS (
+    UPDATE users SET bal=users.bal+(expired.metadata->>'stake')::bigint
+    FROM expired WHERE users.id=expired.user_id
+    RETURNING users.id
+  ) SELECT COUNT(*)::int AS refunded FROM refund`;
+}
+
+async function settleExpiredSoloGuesses(q, userId=null) {
+  await q`WITH expired AS (
+    UPDATE solo_guess_sessions SET completed_at=now()
+    WHERE completed_at IS NULL AND expires_at<=now()
+      AND (${userId}::int IS NULL OR user_id=${userId})
+    RETURNING user_id,stake,attempts
+  ), refund AS (
+    UPDATE users SET bal=users.bal+expired.stake
+    FROM expired WHERE users.id=expired.user_id AND expired.attempts=0
+    RETURNING users.id
+  ) SELECT COUNT(*)::int AS refunded FROM refund`;
+}
+
+async function settleExpiredMines(q, userId=null) {
+  await q`WITH expired AS (
+    UPDATE mines_sessions SET status='expired',completed_at=now(),version=version+1
+    WHERE status='active' AND expires_at<=now()
+      AND (${userId}::int IS NULL OR user_id=${userId})
+    RETURNING user_id,stake,state
+  ), refund AS (
+    UPDATE users SET
+      bal=users.bal+CASE WHEN COALESCE(jsonb_array_length(expired.state->'opened'),0)=0 THEN expired.stake ELSE 0 END,
+      game_points=users.game_points+CASE WHEN COALESCE(jsonb_array_length(expired.state->'opened'),0)>0 THEN 1 ELSE 0 END
+    FROM expired WHERE users.id=expired.user_id
+    RETURNING users.id
+  ) SELECT COUNT(*)::int AS expired,(SELECT COUNT(*) FROM refund)::int AS settled FROM expired`;
+}
+
 async function settleExpiredMatch(q, matchId) {
   const rows = await q`WITH done AS (
     UPDATE game_matches SET
@@ -650,14 +771,23 @@ async function settleExpiredMatch(q, matchId) {
       winner_id=CASE
         WHEN game='cookie' AND creator_score>opponent_score THEN creator_id
         WHEN game='cookie' AND opponent_score>creator_score THEN opponent_id
+        WHEN game='guess' AND status='active' AND turn_user_id=creator_id THEN opponent_id
+        WHEN game='guess' AND status='active' AND turn_user_id=opponent_id THEN creator_id
         ELSE NULL END,
       settled=true
     WHERE id=${matchId} AND status IN ('choosing','active') AND settled=false AND ends_at IS NOT NULL AND ends_at<=now()
-    RETURNING id,game,creator_id,opponent_id,winner_id,creator_score,opponent_score
-  ), reward AS (
-    UPDATE users SET ok=ok+5 WHERE id=(SELECT winner_id FROM done) RETURNING id
-  ), points AS (
-    UPDATE users SET game_points=game_points+1 WHERE id IN (SELECT creator_id FROM done UNION SELECT opponent_id FROM done) RETURNING id
+    RETURNING id,game,creator_id,opponent_id,winner_id,creator_score,opponent_score,stake
+  ), accounts AS (
+    UPDATE users SET
+      bal=users.bal+CASE
+        WHEN done.winner_id=users.id THEN done.stake*2
+        WHEN done.winner_id IS NULL THEN done.stake
+        ELSE 0 END,
+      ok=users.ok+CASE WHEN done.winner_id=users.id THEN 5 ELSE 0 END,
+      game_points=users.game_points+1
+    FROM done
+    WHERE users.id IN (done.creator_id,done.opponent_id)
+    RETURNING users.id
   ) SELECT * FROM done`;
   const row=rows[0];
   if(row){
@@ -665,7 +795,9 @@ async function settleExpiredMatch(q, matchId) {
     const [opponent]=await q`SELECT nick FROM users WHERE id=${row.opponent_id}`;
     const winner=Number(row.winner_id)===Number(row.creator_id)?creator?.nick:Number(row.winner_id)===Number(row.opponent_id)?opponent?.nick:null;
     const summary=row.game==='cookie'?`Рахунок ${row.creator_score}:${row.opponent_score}. `:'';
-    const message=winner?`🏁 Матч №${matchId} завершено. ${summary}Переможець: ${winner}.`:`Матч №${matchId} завершено внічию. ${summary}`;
+    const pot=Number(row.stake||0)*2;
+    const stakeInfo=Number(row.stake||0)>0?(winner?` Виграш: ${pot.toLocaleString('uk-UA')} грн.`:` Обом повернуто по ${Number(row.stake).toLocaleString('uk-UA')} грн.`):'';
+    const message=winner?`🏁 Матч №${matchId} завершено. ${summary}Переможець: ${winner}.${stakeInfo}`:`Матч №${matchId} завершено внічию. ${summary}${stakeInfo}`;
     await inbox(q,Number(row.creator_id),'AFK Games',message);
     await inbox(q,Number(row.opponent_id),'AFK Games',message);
   }
@@ -685,6 +817,186 @@ const CASE_CATALOG = [
   {id:'mythic',name:'Міфічний комплект',rarity:'Міфічний',price:50000,car:'Mercedes-AMG C 63 (W205)',art:'mythic',description:'Потужний спортивний седан'},
   {id:'legendary',name:'Легендарний комплект',rarity:'Легендарний',price:100000,car:'Aston Martin Vantage',art:'legendary',description:'Преміальний спортивний автомобіль'}
 ].map(item=>({...item,vehicle:CAR_CATALOG.find(car=>car.name===item.car)}));
+
+const BJ_SUITS = ['♠','♥','♦','♣'];
+const BJ_RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const BJ_SYMBOLS = [
+  {symbol:'🍒',weight:31,multiplier:11.0,label:'Вишні'},
+  {symbol:'🍋',weight:25,multiplier:12.5,label:'Лимон'},
+  {symbol:'🍇',weight:18,multiplier:16.0,label:'Виноград'},
+  {symbol:'🔔',weight:13,multiplier:22.5,label:'Дзвін'},
+  {symbol:'💎',weight:8,multiplier:40.0,label:'Діамант'},
+  {symbol:'7️⃣',weight:4,multiplier:100.0,label:'Сімка'},
+  {symbol:'💰',weight:1,multiplier:500.0,label:'ДЖЕКПОТ'}
+];
+
+function parseJson(value, fallback={}) {
+  if (value && typeof value === 'object') return value;
+  try { return JSON.parse(String(value || '')); } catch { return fallback; }
+}
+function shuffledDeck() {
+  const deck=[];
+  for(const suit of BJ_SUITS) for(const rank of BJ_RANKS) deck.push({rank,suit});
+  for(let i=deck.length-1;i>0;i--){const j=randomInt(0,i+1);[deck[i],deck[j]]=[deck[j],deck[i]];}
+  return deck;
+}
+function cardValue(card) {
+  if(card.rank==='A') return 11;
+  if(['K','Q','J'].includes(card.rank)) return 10;
+  return Number(card.rank);
+}
+function blackjackTotal(cards=[]) {
+  let total=cards.reduce((sum,card)=>sum+cardValue(card),0);
+  let aces=cards.filter(card=>card.rank==='A').length;
+  while(total>21&&aces>0){total-=10;aces--;}
+  return total;
+}
+function isNatural(cards=[]) { return cards.length===2&&blackjackTotal(cards)===21; }
+function createBlackjackState(mode) {
+  const deck=shuffledDeck();
+  const take=()=>deck.pop();
+  const creator=[take(),take()];
+  const opponent=mode==='friend'?[take(),take()]:null;
+  const dealer=[take(),take()];
+  return {
+    deck,
+    dealer,
+    dealerNatural:isNatural(dealer),
+    players:{
+      creator:{cards:creator,done:isNatural(creator)},
+      opponent:opponent?{cards:opponent,done:isNatural(opponent)}:null
+    }
+  };
+}
+function settleBlackjackState(state, mode) {
+  const dealer=state.dealer;
+  if(!state.dealerNatural){
+    while(blackjackTotal(dealer)<17 && state.deck.length) dealer.push(state.deck.pop());
+  }
+  const dealerScore=blackjackTotal(dealer),dealerBust=dealerScore>21;
+  const payouts={creator:0,opponent:0};
+  const results={creator:null,opponent:null};
+  for(const role of (mode==='friend'?['creator','opponent']:['creator'])){
+    const hand=state.players[role]?.cards||[];
+    const score=blackjackTotal(hand),natural=isNatural(hand),bust=score>21;
+    let outcome='lose',multiplier=0;
+    if(natural&&state.dealerNatural){outcome='push';multiplier=1;}
+    else if(natural){outcome='blackjack';multiplier=2.5;}
+    else if(state.dealerNatural){outcome='lose';multiplier=0;}
+    else if(bust){outcome='lose';multiplier=0;}
+    else if(dealerBust||score>dealerScore){outcome='win';multiplier=2;}
+    else if(score===dealerScore){outcome='push';multiplier=1;}
+    payouts[role]=multiplier;
+    results[role]={outcome,score,natural,multiplier};
+  }
+  state.results={dealerScore,dealerBust,players:results};
+  return payouts;
+}
+function publicBlackjackState(state, completed=false) {
+  if(!state) return null;
+  return {
+    dealer:completed?state.dealer:[state.dealer?.[0]||null,{hidden:true}],
+    dealerTotal:completed?blackjackTotal(state.dealer):cardValue(state.dealer?.[0]||{rank:'0'}),
+    players:{
+      creator:state.players?.creator?{cards:state.players.creator.cards,done:Boolean(state.players.creator.done),total:blackjackTotal(state.players.creator.cards)}:null,
+      opponent:state.players?.opponent?{cards:state.players.opponent.cards,done:Boolean(state.players.opponent.done),total:blackjackTotal(state.players.opponent.cards)}:null
+    },
+    results:completed?state.results:null
+  };
+}
+function blackjackRowView(row,userId) {
+  const creatorMe=Number(row.creator_id)===Number(userId);
+  const state=parseJson(row.state,null);
+  return {
+    id:Number(row.id),mode:row.mode,status:row.status,stake:Number(row.stake),
+    creator:row.creator_nick||null,opponent:row.opponent_nick||null,
+    incoming:Number(row.opponent_id)===Number(userId),creatorMe,
+    state:state&&!['pending','rejected'].includes(row.status)?publicBlackjackState(state,['completed','expired'].includes(row.status)):null,
+    payout:Number((creatorMe?row.payout_creator:row.payout_opponent)||0),
+    refunded:row.status==='expired'||(row.status==='rejected'&&creatorMe)?Number(row.stake):0,
+    creatorPayout:Number(row.payout_creator||0),opponentPayout:Number(row.payout_opponent||0),
+    expiresAt:row.expires_at,createdAt:row.created_at
+  };
+}
+function minesMultiplier(bombs,hits) {
+  if(hits<=0) return 1;
+  let probability=1;
+  for(let i=0;i<hits;i++) probability *= (25-bombs-i)/(25-i);
+  return Math.max(1.01,Number((0.97/probability).toFixed(2)));
+}
+function minesRowView(row, reveal=false) {
+  const state=parseJson(row.state,{});
+  return {
+    id:Number(row.id),stake:Number(row.stake),bombCount:Number(row.bomb_count),
+    opened:Array.isArray(state.opened)?state.opened:[],
+    bombs:reveal&&Array.isArray(state.bombs)?state.bombs:[],
+    status:row.status,version:Number(row.version||0),
+    multiplier:minesMultiplier(Number(row.bomb_count),Array.isArray(state.opened)?state.opened.length:0),
+    payout:Number(row.payout||0),
+    expiresAt:row.expires_at
+  };
+}
+function weightedSlotSymbol() {
+  const total=BJ_SYMBOLS.reduce((sum,item)=>sum+item.weight,0);
+  let value=randomInt(1,total+1);
+  for(const item of BJ_SYMBOLS){value-=item.weight;if(value<=0)return item.symbol;}
+  return '🍒';
+}
+function spinSlotReels() {
+  const rows=Array.from({length:5},()=>Array.from({length:3},()=>weightedSlotSymbol()));
+  const wins=[];
+  for(let row=0;row<5;row++){
+    const [a,b,c]=rows[row];
+    if(a===b&&b===c){
+      const symbol=BJ_SYMBOLS.find(item=>item.symbol===a);
+      wins.push({row,symbol:a,multiplier:symbol?.multiplier||0,label:symbol?.label||a});
+    }
+  }
+  return {rows,wins};
+}
+
+async function expireBlackjackSessions(q,userId) {
+  const expired=await q`WITH done AS (
+    UPDATE blackjack_sessions SET status=CASE WHEN status='pending' THEN 'rejected' ELSE 'expired' END,
+      completed_at=now(),version=version+1
+    WHERE status IN ('pending','active') AND expires_at<=now()
+      AND (${userId}::int IS NULL OR creator_id=${userId} OR opponent_id=${userId})
+    RETURNING creator_id,opponent_id,stake,state,status
+  ), refunds AS (
+    UPDATE users SET bal=users.bal+CASE
+      WHEN users.id=done.creator_id THEN done.stake
+      WHEN done.status='expired' AND users.id=done.opponent_id THEN done.stake
+      ELSE 0 END
+    FROM done WHERE users.id=done.creator_id OR (done.status='expired' AND users.id=done.opponent_id)
+    RETURNING users.id
+  ) SELECT done.* FROM done CROSS JOIN (SELECT COUNT(*) FROM refunds) AS applied_refunds`;
+  return expired;
+}
+async function completeBlackjackIfReady(q,row) {
+  const state=parseJson(row.state,{});
+  const roles=row.mode==='friend'?['creator','opponent']:['creator'];
+  if(state.dealerNatural){for(const role of roles) if(state.players?.[role]) state.players[role].done=true;}
+  if(!roles.every(role=>state.players?.[role]?.done)) return row;
+  const multipliers=settleBlackjackState(state,row.mode);
+  const stake=Number(row.stake);
+  const payoutCreator=Math.floor(stake*(multipliers.creator||0));
+  const payoutOpponent=row.mode==='friend'?Math.floor(stake*(multipliers.opponent||0)):0;
+  const [saved]=await q`WITH moved AS (
+    UPDATE blackjack_sessions SET status='completed',state=${JSON.stringify(state)}::jsonb,
+      payout_creator=${payoutCreator},payout_opponent=${payoutOpponent},completed_at=now(),version=version+1
+    WHERE id=${row.id} AND status='active' AND version=${Number(row.version||0)}
+    RETURNING id,creator_id,opponent_id,payout_creator,payout_opponent,stake
+  ), paid AS (
+    UPDATE users SET
+      bal=users.bal+CASE WHEN users.id=moved.creator_id THEN moved.payout_creator ELSE moved.payout_opponent END,
+      ok=users.ok+CASE WHEN (users.id=moved.creator_id AND moved.payout_creator>moved.stake) OR (users.id=moved.opponent_id AND moved.payout_opponent>moved.stake) THEN 5 ELSE 0 END,
+      game_points=users.game_points+1
+    FROM moved WHERE users.id=moved.creator_id OR users.id=moved.opponent_id
+    RETURNING users.id
+  ) SELECT moved.* FROM moved CROSS JOIN (SELECT COUNT(*) FROM paid) AS applied_payments`;
+  return saved?{...row,...saved,status:'completed',state,payout_creator:payoutCreator,payout_opponent:payoutOpponent,version:Number(row.version||0)+1}:null;
+}
+
 
 const PublicActions = {
   async register(payload) {
@@ -933,63 +1245,393 @@ const Actions = {
     return {car:item.car,case:{id:item.id,name:item.name,rarity:item.rarity,art:item.art,price:item.price,car:item.car,carValue:item.vehicle.value},me:await getMe(userId)};
   },
 
+  async blackjackStart(userId,payload) {
+    const q=await getSql();
+    await expireBlackjackSessions(q,userId);
+    const [existing]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id
+      LEFT JOIN users o ON o.id=s.opponent_id
+      WHERE (s.creator_id=${userId} OR s.opponent_id=${userId}) AND s.status IN ('pending','active') AND s.expires_at>now()
+      ORDER BY s.created_at DESC LIMIT 1`;
+    if(existing)return {session:blackjackRowView(existing,userId),resumed:true,me:await getMe(userId)};
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
+    const state=createBlackjackState('solo');
+    const [created]=await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake} WHERE id=${userId} AND bal>=${stake} RETURNING id
+    ), inserted AS (
+      INSERT INTO blackjack_sessions(mode,creator_id,stake,status,state,expires_at)
+      SELECT 'solo',id,${stake},'active',${JSON.stringify(state)}::jsonb,now()+interval '30 minutes'
+      FROM debit RETURNING id
+    ) SELECT id FROM inserted`;
+    if(!created)throw new E('На балансі недостатньо коштів для такої ставки');
+    let [row]=await q`SELECT s.*,c.nick AS creator_nick,NULL::text AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id WHERE s.id=${created.id}`;
+    const completed=await completeBlackjackIfReady(q,row);
+    if(completed)row=completed;
+    const [fresh]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id WHERE s.id=${created.id}`;
+    return {session:blackjackRowView(fresh||row,userId),resumed:false,me:await getMe(userId)};
+  },
+
+  async blackjackCreate(userId,payload) {
+    const q=await getSql();
+    await expireBlackjackSessions(q,userId);
+    const nick=String(payload.nick||'').trim().toLocaleLowerCase('uk-UA');
+    if(!nick)throw new E('Вкажи нік друга');
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
+    const [opponent]=await q`SELECT id,nick FROM users WHERE nick_lc=${nick} AND id<>${userId}`;
+    if(!opponent)throw new E('Гравця не знайдено');
+    const [busy]=await q`SELECT id FROM blackjack_sessions WHERE status IN ('pending','active')
+      AND (creator_id IN (${userId},${opponent.id}) OR opponent_id IN (${userId},${opponent.id})) LIMIT 1`;
+    if(busy)throw new E('Один із гравців уже має незавершену гру в блек-джек');
+    const state=createBlackjackState('friend');
+    const [created]=await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake} WHERE id=${userId} AND bal>=${stake} RETURNING id
+    ), inserted AS (
+      INSERT INTO blackjack_sessions(mode,creator_id,opponent_id,stake,status,state,expires_at)
+      SELECT 'friend',${userId},${opponent.id},${stake},'pending',${JSON.stringify(state)}::jsonb,now()+interval '24 hours'
+      FROM debit RETURNING id
+    ) SELECT id FROM inserted`;
+    if(!created)throw new E('На балансі недостатньо коштів для такої ставки');
+    await inbox(q,opponent.id,'AFK Games',`Тебе запросили у блек-джек з дилером у матчі №${created.id}. Ставка для кожного: ${stake.toLocaleString('uk-UA')} грн. Прийми запрошення в розділі «Мініігри».`);
+    await inbox(q,userId,'AFK Games',`Запрошення на блек-джек надіслано гравцю ${opponent.nick}. Твою ставку ${stake.toLocaleString('uk-UA')} грн зарезервовано.`);
+    return {id:Number(created.id),opponent:opponent.nick,stake,me:await getMe(userId)};
+  },
+
+  async blackjackRespond(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Гру не знайдено');
+    const action=String(payload.action||'');
+    if(!['accept','reject','cancel'].includes(action))throw new E('Невідома дія');
+    if(action==='reject'||action==='cancel'){
+      const [row]=action==='reject'
+        ? await q`WITH ended AS (
+            UPDATE blackjack_sessions SET status='rejected',completed_at=now(),version=version+1
+            WHERE id=${id} AND mode='friend' AND opponent_id=${userId} AND status='pending'
+            RETURNING creator_id,stake
+          ), refund AS (
+            UPDATE users SET bal=bal+ended.stake FROM ended WHERE users.id=ended.creator_id RETURNING users.id
+          ) SELECT ended.creator_id,ended.stake FROM ended CROSS JOIN (SELECT COUNT(*) FROM refund) AS applied_refund`
+        : await q`WITH ended AS (
+            UPDATE blackjack_sessions SET status='rejected',completed_at=now(),version=version+1
+            WHERE id=${id} AND mode='friend' AND creator_id=${userId} AND status='pending'
+            RETURNING creator_id,stake
+          ), refund AS (
+            UPDATE users SET bal=bal+ended.stake FROM ended WHERE users.id=ended.creator_id RETURNING users.id
+          ) SELECT ended.creator_id,ended.stake FROM ended CROSS JOIN (SELECT COUNT(*) FROM refund) AS applied_refund`;
+      if(!row)throw new E('Запрошення вже оброблено або його не можна скасувати');
+      const notify=action==='reject'?Number(row.creator_id):Number(row.creator_id);
+      await inbox(q,notify,'AFK Games',`Запрошення на блек-джек №${id} відхилено або скасовано. Ставку ${Number(row.stake).toLocaleString('uk-UA')} грн повернуто.`);
+      return {ok:true,refunded:Number(row.stake),me:await getMe(userId)};
+    }
+    const [accepted]=await q`WITH pending AS MATERIALIZED (
+      SELECT id,stake FROM blackjack_sessions WHERE id=${id} AND mode='friend' AND opponent_id=${userId} AND status='pending' FOR UPDATE
+    ), debit AS (
+      UPDATE users SET bal=bal-(SELECT stake FROM pending)
+      WHERE id=${userId} AND EXISTS(SELECT 1 FROM pending) AND bal >= (SELECT stake FROM pending)
+      RETURNING id
+    ), changed AS (
+      UPDATE blackjack_sessions SET status='active',expires_at=now()+interval '30 minutes',version=version+1
+      WHERE id=(SELECT id FROM pending) AND status='pending' AND EXISTS(SELECT 1 FROM debit)
+      RETURNING id
+    ) SELECT id FROM changed`;
+    if(!accepted)throw new E('Не вдалося прийняти гру. Перевір баланс: потрібна така сама ставка, як у запрошенні.');
+    let [row]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id WHERE s.id=${id}`;
+    const completed=await completeBlackjackIfReady(q,row);
+    if(completed)row=completed;
+    const [fresh]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id WHERE s.id=${id}`;
+    await inbox(q,Number(fresh?.creator_id||row.creator_id),'AFK Games',`Запрошення на блек-джек №${id} прийнято. Матч почався!`);
+    return {ok:true,session:blackjackRowView(fresh||row,userId),me:await getMe(userId)};
+  },
+
+  async blackjackAction(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Гру не знайдено');
+    const action=String(payload.action||'');
+    if(!['hit','stand'].includes(action))throw new E('Обери: взяти карту або зупинитися');
+    const [row]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id
+      WHERE s.id=${id} AND (s.creator_id=${userId} OR s.opponent_id=${userId}) AND s.status='active' AND s.expires_at>now()`;
+    if(!row)throw new E('Гру завершено, час вийшов або ти не є її учасником');
+    const state=parseJson(row.state,{});
+    const role=Number(row.creator_id)===Number(userId)?'creator':'opponent';
+    const hand=state.players?.[role];
+    if(!hand||hand.done)throw new E('Твоя рука вже завершена. Чекаємо на дилера або друга.');
+    if(action==='hit'){
+      if(isNatural(hand.cards))throw new E('Блек-джек із двох карт уже готовий — натисни «Зупинитися»');
+      if(!Array.isArray(state.deck)||!state.deck.length)throw new E('У колоді не залишилося карт');
+      hand.cards.push(state.deck.pop());
+      if(blackjackTotal(hand.cards)>=21)hand.done=true;
+    }else hand.done=true;
+    const roles=row.mode==='friend'?['creator','opponent']:['creator'];
+    if(state.dealerNatural)for(const item of roles)if(state.players[item])state.players[item].done=true;
+    if(roles.every(item=>state.players[item]?.done)){
+      const next={...row,state};
+      const completed=await completeBlackjackIfReady(q,next);
+      if(!completed)throw new E('Стан гри вже змінився. Онови картки та повтори дію.');
+    }else{
+      const [saved]=await q`UPDATE blackjack_sessions SET state=${JSON.stringify(state)}::jsonb,version=version+1
+        WHERE id=${id} AND status='active' AND version=${Number(row.version||0)}
+          AND (creator_id=${userId} OR opponent_id=${userId}) RETURNING id`;
+      if(!saved)throw new E('Стан гри вже змінився. Онови картки та повтори дію.');
+    }
+    const [fresh]=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id WHERE s.id=${id}`;
+    return {session:blackjackRowView(fresh,userId),me:await getMe(userId)};
+  },
+
+  async blackjackList(userId) {
+    const q=await getSql();
+    await expireBlackjackSessions(q,userId);
+    const rows=await q`SELECT s.*,c.nick AS creator_nick,o.nick AS opponent_nick
+      FROM blackjack_sessions s JOIN users c ON c.id=s.creator_id LEFT JOIN users o ON o.id=s.opponent_id
+      WHERE (s.creator_id=${userId} OR s.opponent_id=${userId})
+      ORDER BY s.created_at DESC LIMIT 20`;
+    return {sessions:rows.map(row=>blackjackRowView(row,userId)),me:await getMe(userId)};
+  },
+
+  async minesCurrent(userId) {
+    const q=await getSql();
+    await settleExpiredMines(q,userId);
+    const [row]=await q`SELECT * FROM mines_sessions WHERE user_id=${userId} AND status='active' AND expires_at>now() ORDER BY created_at DESC LIMIT 1`;
+    return {session:row?minesRowView(row,false):null,me:await getMe(userId)};
+  },
+
+  async minesStart(userId,payload) {
+    const q=await getSql();
+    await settleExpiredMines(q,userId);
+    const [existing]=await q`SELECT * FROM mines_sessions WHERE user_id=${userId} AND status='active' AND expires_at>now() ORDER BY created_at DESC LIMIT 1`;
+    if(existing)return {session:minesRowView(existing,false),resumed:true,me:await getMe(userId)};
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
+    const bombCount=int(payload.bombCount,3,20,'Обери 3, 5, 10 або 20 бомб');
+    if(![3,5,10,20].includes(bombCount))throw new E('Кількість бомб має бути 3, 5, 10 або 20');
+    const bombs=new Set();while(bombs.size<bombCount)bombs.add(randomInt(0,25));
+    const state={bombs:[...bombs],opened:[]};
+    const [created]=await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake} WHERE id=${userId} AND bal>=${stake} RETURNING id
+    ), inserted AS (
+      INSERT INTO mines_sessions(user_id,stake,bomb_count,state,expires_at)
+      SELECT id,${stake},${bombCount},${JSON.stringify(state)}::jsonb,now()+interval '20 minutes'
+      FROM debit RETURNING id
+    ) SELECT id FROM inserted`;
+    if(!created)throw new E('На балансі недостатньо коштів для такої ставки');
+    const [row]=await q`SELECT * FROM mines_sessions WHERE id=${created.id}`;
+    return {session:minesRowView(row,false),resumed:false,me:await getMe(userId)};
+  },
+
+  async minesPick(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Раунд не знайдено');
+    const cell=int(payload.cell,0,24,'Обери клітинку на полі');
+    const [row]=await q`SELECT * FROM mines_sessions WHERE id=${id} AND user_id=${userId} AND status='active' AND expires_at>now()`;
+    if(!row)throw new E('Раунд завершено або час вийшов');
+    const state=parseJson(row.state,{});
+    if((state.opened||[]).includes(cell))throw new E('Ця клітинка вже відкрита');
+    const hitBomb=(state.bombs||[]).includes(cell);
+    state.opened=[...(state.opened||[]),cell];
+    let status='active',payout=0;
+    if(hitBomb)status='lost';
+    else if(state.opened.length>=25-Number(row.bomb_count)){
+      status='won';payout=Math.floor(Number(row.stake)*minesMultiplier(Number(row.bomb_count),state.opened.length));
+    }
+    const [saved]=await q`WITH moved AS (
+      UPDATE mines_sessions SET state=${JSON.stringify(state)}::jsonb,status=${status},payout=${payout},
+        completed_at=CASE WHEN ${status}='active' THEN NULL ELSE now() END,version=version+1
+      WHERE id=${id} AND user_id=${userId} AND status='active' AND version=${Number(row.version||0)}
+      RETURNING id,status,payout,stake,bomb_count,state
+    ), wallet AS (
+      UPDATE users SET bal=bal+CASE WHEN moved.status='won' THEN moved.payout ELSE 0 END,
+        game_points=game_points+1
+      FROM moved WHERE users.id=${userId} AND moved.status IN ('won','lost')
+      RETURNING users.bal
+    ) SELECT moved.* FROM moved CROSS JOIN (SELECT COUNT(*) FROM wallet) AS applied_wallet`;
+    if(!saved)throw new E('Стан поля вже змінився. Онови гру та повтори дію.');
+    const view=minesRowView(saved,saved.status!=='active');
+    return {session:view,hitBomb,status:saved.status,stake:Number(saved.stake),payout:Number(saved.payout),net:Number(saved.payout)-Number(saved.stake),me:await getMe(userId)};
+  },
+
+  async minesCashout(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Раунд не знайдено');
+    const [row]=await q`SELECT * FROM mines_sessions WHERE id=${id} AND user_id=${userId} AND status='active' AND expires_at>now()`;
+    if(!row)throw new E('Раунд завершено або час вийшов');
+    const state=parseJson(row.state,{});
+    if(!(state.opened||[]).length)throw new E('Відкрий хоча б одну безпечну клітинку перед тим, як забрати виграш');
+    const payout=Math.floor(Number(row.stake)*minesMultiplier(Number(row.bomb_count),state.opened.length));
+    const [saved]=await q`WITH moved AS (
+      UPDATE mines_sessions SET status='won',payout=${payout},completed_at=now(),version=version+1
+      WHERE id=${id} AND user_id=${userId} AND status='active' AND version=${Number(row.version||0)}
+      RETURNING id,status,payout,stake,bomb_count,state
+    ), wallet AS (
+      UPDATE users SET bal=bal+moved.payout,game_points=game_points+1
+      FROM moved WHERE users.id=${userId} RETURNING users.bal
+    ) SELECT moved.* FROM moved CROSS JOIN (SELECT COUNT(*) FROM wallet) AS applied_wallet`;
+    if(!saved)throw new E('Стан поля вже змінився. Онови гру та повтори дію.');
+    return {session:minesRowView(saved,true),payout,stake:Number(saved.stake),net:payout-Number(saved.stake),me:await getMe(userId)};
+  },
+
+  async slotSpin(userId,payload) {
+    const q=await getSql();
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
+    const {rows,wins}=spinSlotReels();
+    const lineStakes=Array.from({length:5},(_,i)=>Math.floor(stake/5)+(i<stake%5?1:0));
+    let payout=0;
+    const paidLines=wins.map(win=>{
+      const lineStake=lineStakes[win.row];
+      const linePayout=Math.floor(lineStake*win.multiplier);
+      payout+=linePayout;
+      return {...win,lineStake,payout:linePayout};
+    });
+    const result={rows,wins:paidLines};
+    const [saved]=await q`WITH wallet AS (
+      UPDATE users SET bal=bal-${stake}+${payout},
+        ok=ok+CASE WHEN ${payout}>${stake} THEN 5 ELSE 0 END,
+        game_points=game_points+1
+      WHERE id=${userId} AND bal>=${stake} RETURNING id,bal
+    ), logged AS (
+      INSERT INTO slot_spins(user_id,stake,payout,result)
+      SELECT id,${stake},${payout},${JSON.stringify(result)}::jsonb FROM wallet RETURNING id
+    ) SELECT wallet.id,wallet.bal,logged.id AS spin_id FROM wallet CROSS JOIN logged`;
+    if(!saved)throw new E('На балансі недостатньо коштів для такої ставки');
+    return {spinId:Number(saved.spin_id),stake,payout,net:payout-stake,rows,wins:paidLines,me:await getMe(userId)};
+  },
+
   async soloGuessStart(userId,payload) {
     const q=await getSql();
-    const levels={easy:{max:3,attempts:3,xp:3},medium:{max:5,attempts:5,xp:5},hard:{max:10,attempts:7,xp:8},impossible:{max:50,attempts:10,xp:12}};
+    const levels={
+      easy:{max:3,attempts:3,xp:3,payout:1.00},
+      medium:{max:5,attempts:5,xp:5,payout:1.00},
+      hard:{max:10,attempts:7,xp:8,payout:1.30},
+      impossible:{max:50,attempts:10,xp:12,payout:4.00}
+    };
     const difficulty=String(payload.difficulty||'');
     const config=levels[difficulty];
     if(!config) throw new E('Обери рівень складності');
-    await q`UPDATE solo_guess_sessions SET completed_at=now() WHERE user_id=${userId} AND completed_at IS NULL AND expires_at<=now()`;
+    await settleExpiredSoloGuesses(q,userId);
+    const [existing]=await q`SELECT id,difficulty,range_max,attempts,max_attempts,xp_reward,stake,payout_multiplier
+      FROM solo_guess_sessions
+      WHERE user_id=${userId} AND completed_at IS NULL AND expires_at>now()
+      ORDER BY created_at DESC LIMIT 1`;
+    if(existing) return {id:Number(existing.id),difficulty:existing.difficulty,rangeMax:Number(existing.range_max),
+      attempts:Number(existing.attempts),maxAttempts:Number(existing.max_attempts),xpReward:Number(existing.xp_reward),
+      stake:Number(existing.stake),payoutMultiplier:Number(existing.payout_multiplier),resumed:true,me:await getMe(userId)};
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
     const answer=randomInt(1,config.max+1);
-    const [row]=await q`INSERT INTO solo_guess_sessions(user_id,difficulty,range_max,answer,max_attempts,xp_reward,expires_at)
-      VALUES(${userId},${difficulty},${config.max},${answer},${config.attempts},${config.xp},now()+interval '10 minutes') RETURNING id`;
-    return {id:Number(row.id),difficulty,rangeMax:config.max,maxAttempts:config.attempts,xpReward:config.xp};
+    const [row]=await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake}
+      WHERE id=${userId} AND bal>=${stake}
+      RETURNING id
+    ), session AS (
+      INSERT INTO solo_guess_sessions(user_id,difficulty,range_max,answer,max_attempts,xp_reward,stake,payout_multiplier,expires_at)
+      SELECT ${userId},${difficulty},${config.max},${answer},${config.attempts},${config.xp},${stake},${config.payout},now()+interval '10 minutes'
+      FROM debit
+      RETURNING id
+    ) SELECT id FROM session`;
+    if(!row) throw new E('На балансі недостатньо коштів для такої ставки');
+    return {id:Number(row.id),difficulty,rangeMax:config.max,attempts:0,maxAttempts:config.attempts,xpReward:config.xp,stake,payoutMultiplier:config.payout,resumed:false,me:await getMe(userId)};
   },
 
   async soloGuessTry(userId,payload) {
     const q=await getSql();
     const id=int(payload.id,1,2_000_000_000,'Раунд не знайдено');
     const guess=int(payload.guess,1,50,'Введи ціле число в межах обраного рівня');
-    const [row]=await q`UPDATE solo_guess_sessions SET
-      attempts=attempts+1,
-      solved=(answer=${guess}),
-      completed_at=CASE WHEN answer=${guess} OR attempts+1>=max_attempts THEN now() ELSE NULL END
+    await settleExpiredSoloGuesses(q,userId);
+    const [row]=await q`WITH attempt AS (
+      UPDATE solo_guess_sessions SET
+        attempts=attempts+1,
+        solved=(answer=${guess}),
+        completed_at=CASE WHEN answer=${guess} OR attempts+1>=max_attempts THEN now() ELSE NULL END
       WHERE id=${id} AND user_id=${userId} AND completed_at IS NULL AND expires_at>now() AND ${guess}<=range_max
-      RETURNING answer,range_max,attempts,max_attempts,xp_reward,solved,completed_at`;
+      RETURNING answer,range_max,attempts,max_attempts,xp_reward,solved,completed_at,stake,payout_multiplier
+    ), wallet AS (
+      UPDATE users SET
+        ok=ok+CASE WHEN attempt.solved THEN attempt.xp_reward ELSE 0 END,
+        game_points=game_points+CASE WHEN attempt.completed_at IS NOT NULL THEN 1 ELSE 0 END,
+        bal=bal+CASE WHEN attempt.solved THEN FLOOR(attempt.stake*attempt.payout_multiplier)::bigint ELSE 0 END
+      FROM attempt
+      WHERE users.id=${userId}
+      RETURNING bal
+    )
+    SELECT attempt.*,wallet.bal FROM attempt CROSS JOIN wallet`;
     if(!row) throw new E('Раунд завершено, час вийшов або число поза діапазоном. Почни новий раунд.');
-    if(row.solved) await q`UPDATE users SET ok=ok+${Number(row.xp_reward)} WHERE id=${userId}`;
     const finished=Boolean(row.completed_at);
-    if(finished) await q`UPDATE users SET game_points=game_points+1 WHERE id=${userId}`;
+    const stake=Number(row.stake||0);
+    const payout=row.solved?Math.floor(stake*Number(row.payout_multiplier||1)):0;
     return {correct:Boolean(row.solved),hint:row.solved?'correct':finished?'finished':guess<Number(row.answer)?'higher':'lower',
       attempts:Number(row.attempts),maxAttempts:Number(row.max_attempts),rangeMax:Number(row.range_max),
-      answer:finished?Number(row.answer):null,xp:row.solved?Number(row.xp_reward):0,finished,me:await getMe(userId)};
+      answer:finished?Number(row.answer):null,xp:row.solved?Number(row.xp_reward):0,finished,
+      stake,payout,net:finished?payout-stake:null,me:await getMe(userId)};
+  },
+
+  async soloGuessCancel(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Раунд не знайдено');
+    await settleExpiredSoloGuesses(q,userId);
+    const [row]=await q`WITH cancelled AS (
+      UPDATE solo_guess_sessions SET completed_at=now()
+      WHERE id=${id} AND user_id=${userId} AND completed_at IS NULL AND attempts=0
+      RETURNING stake
+    ), refund AS (
+      UPDATE users SET bal=users.bal+cancelled.stake
+      FROM cancelled WHERE users.id=${userId}
+      RETURNING bal
+    )
+    SELECT cancelled.stake,refund.bal FROM cancelled CROSS JOIN refund`;
+    if(!row) throw new E('Раунд уже почався: після першої спроби скасувати ставку не можна');
+    return {refunded:Number(row.stake),me:await getMe(userId)};
   },
 
   async gamesStart(userId,payload) {
     const q=await getSql();
     const game=String(payload.game||'');
-    if(game!=='coin') throw new E('Доступна лише безкоштовна анімація монетки. Печенька та число — тільки матчі з другом.');
+    if(game!=='coin') throw new E('Невідомий тип гри');
     const prediction=String(payload.prediction||'');
     if(!['heads','tails'].includes(prediction)) throw new E('Обери орла або решку перед кидком');
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
+    await settleExpiredCoinWagers(q,userId);
     const recent=await q`SELECT id FROM game_challenges WHERE user_id=${userId} AND created_at>now()-interval '2 seconds' LIMIT 1`;
     if(recent.length) throw new E('Зроби коротку паузу перед наступним кидком');
     const answer=randomInt(0,2)?'heads':'tails';
-    const [row]=await q`INSERT INTO game_challenges(user_id,game,answer,prompt,metadata,expires_at)
-      VALUES(${userId},'coin',${answer},'50/50',${JSON.stringify({prediction})}::jsonb,now()+interval '2 minutes') RETURNING id`;
-    return {challenge:{id:row.id,game:'coin',prompt:'50/50',seconds:45}};
+    const [row]=await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake}
+      WHERE id=${userId} AND bal>=${stake}
+      RETURNING id
+    ), challenge AS (
+      INSERT INTO game_challenges(user_id,game,answer,prompt,metadata,expires_at)
+      SELECT ${userId},'coin',${answer},'50/50',${JSON.stringify({prediction,stake})}::jsonb,now()+interval '2 minutes'
+      FROM debit
+      RETURNING id
+    ) SELECT id FROM challenge`;
+    if(!row) throw new E('На балансі недостатньо коштів для такої ставки');
+    return {challenge:{id:row.id,game:'coin',prompt:'50/50',seconds:45,stake},me:await getMe(userId)};
   },
   async gamesFinish(userId,payload) {
     const q=await getSql();
     const id=int(payload.id,1,2_000_000_000,'Кидок не знайдено');
-    const [challenge]=await q`UPDATE game_challenges SET completed_at=now()
+    await settleExpiredCoinWagers(q,userId);
+    const [row]=await q`WITH completed AS (
+      UPDATE game_challenges SET completed_at=now()
       WHERE id=${id} AND user_id=${userId} AND game='coin' AND completed_at IS NULL AND expires_at>now()
-      RETURNING answer,metadata`;
-    if(!challenge) throw new E('Кидок уже використано або час вийшов');
-    const meta=typeof challenge.metadata==='string'?JSON.parse(challenge.metadata||'{}'):(challenge.metadata||{});
-    const correct=String(meta.prediction)===String(challenge.answer);
-    const points=1;
-    await q`UPDATE users SET game_points=game_points+1 WHERE id=${userId}`;
-    return {correct,points,result:{side:challenge.answer,prediction:meta.prediction},me:await getMe(userId)};
+      RETURNING answer,metadata
+    ), wallet AS (
+      UPDATE users SET
+        bal=bal+CASE WHEN completed.metadata->>'prediction'=completed.answer
+          THEN COALESCE((completed.metadata->>'stake')::bigint,0)*2 ELSE 0 END,
+        game_points=game_points+1
+      FROM completed
+      WHERE users.id=${userId}
+      RETURNING bal
+    )
+    SELECT completed.answer,completed.metadata,wallet.bal
+    FROM completed CROSS JOIN wallet`;
+    if(!row) throw new E('Кидок уже використано або час вийшов');
+    const meta=typeof row.metadata==='string'?JSON.parse(row.metadata||'{}'):(row.metadata||{});
+    const correct=String(meta.prediction)===String(row.answer);
+    const stake=Number(meta.stake||0),payout=correct?stake*2:0;
+    return {correct,points:1,stake,payout,net:payout-stake,
+      result:{side:row.answer,prediction:meta.prediction},me:await getMe(userId)};
   },
   async matchCreate(userId, payload) {
     const q = await getSql();
@@ -997,38 +1639,82 @@ const Actions = {
     if (!['cookie','guess'].includes(game)) throw new E('Невідомий тип матчу');
     const nick = String(payload.nick || '').trim().toLocaleLowerCase('uk-UA');
     if (!nick) throw new E('Вкажи нік суперника');
+    const stake=int(payload.stake,GAME_STAKE_MIN,GAME_STAKE_MAX,`Ставка має бути від ${GAME_STAKE_MIN} до ${GAME_STAKE_MAX.toLocaleString('uk-UA')} грн`);
     const [opponent] = await q`SELECT id,nick FROM users WHERE nick_lc=${nick} AND id<>${userId}`;
     if (!opponent) throw new E('Гравця не знайдено');
-    await q`UPDATE game_matches SET status='rejected' WHERE status='pending' AND created_at < now()-interval '24 hours' AND (creator_id=${userId} OR opponent_id=${userId})`;
+    await settleExpiredPendingMatches(q,userId,Number(opponent.id));
     const [existing] = await q`SELECT id FROM game_matches WHERE status IN ('pending','choosing','active') AND (creator_id=${userId} OR opponent_id=${userId} OR creator_id=${opponent.id} OR opponent_id=${opponent.id}) LIMIT 1`;
     if (existing) throw new E('Один із гравців уже має незавершений матч');
-    const [row] = await q`INSERT INTO game_matches(game,creator_id,opponent_id)
-      VALUES(${game},${userId},${opponent.id}) RETURNING id`;
-    await inbox(q,opponent.id,'AFK Games',`Гравець запросив тебе в ${game==='cookie'?'Печеньку':'Вгадай число'} · матч №${row.id}. Відкрий розділ Мініігри, щоб відповісти.`);
-    await inbox(q,userId,'AFK Games',`Запрошення надіслано гравцю ${opponent.nick}. Матч №${row.id} очікує відповіді.`);
-    return { id:row.id, opponent:opponent.nick };
+    const [row] = await q`WITH debit AS (
+      UPDATE users SET bal=bal-${stake}
+      WHERE id=${userId} AND bal>=${stake}
+      RETURNING id
+    ), created AS (
+      INSERT INTO game_matches(game,creator_id,opponent_id,stake)
+      SELECT ${game},${userId},${opponent.id},${stake}
+      FROM debit
+      RETURNING id
+    ) SELECT id FROM created`;
+    if(!row) throw new E('На балансі недостатньо коштів для такої ставки');
+    const pot=stake*2;
+    await inbox(q,opponent.id,'AFK Games',`Гравець запросив тебе в ${game==='cookie'?'Печеньку':'Вгадай число'} · матч №${row.id}. Ставка для кожного: ${stake.toLocaleString('uk-UA')} грн, переможець забере ${pot.toLocaleString('uk-UA')} грн. Відкрий розділ Мініігри, щоб відповісти.`);
+    await inbox(q,userId,'AFK Games',`Запрошення надіслано гравцю ${opponent.nick}. Матч №${row.id} очікує відповіді. Твою ставку ${stake.toLocaleString('uk-UA')} грн зарезервовано.`);
+    return { id:row.id, opponent:opponent.nick, stake, pot };
   },
 
   async matchRespond(userId, payload) {
     const q = await getSql();
     const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
     const action = String(payload.action || '');
-    if (!['accept','reject'].includes(action)) throw new E('Невідома дія');
-    if (action === 'reject') {
-      const rows=await q`UPDATE game_matches SET status='rejected' WHERE id=${id} AND opponent_id=${userId} AND status='pending' RETURNING creator_id`;
-      if (!rows.length) throw new E('Запрошення вже оброблено');
-      await inbox(q,rows[0].creator_id,'AFK Games',`Запрошення в матч №${id} відхилено.`);
-      return { ok:true };
+    if (!['accept','reject','cancel'].includes(action)) throw new E('Невідома дія');
+    if (action === 'reject' || action === 'cancel') {
+      const rows=action==='reject'
+        ? await q`WITH rejected AS (
+            UPDATE game_matches SET status='rejected',settled=true
+            WHERE id=${id} AND opponent_id=${userId} AND status='pending' AND settled=false
+            RETURNING creator_id,opponent_id,stake
+          ), refund AS (
+            UPDATE users SET bal=users.bal+rejected.stake
+            FROM rejected WHERE users.id=rejected.creator_id
+            RETURNING users.id
+          )
+          SELECT creator_id,opponent_id,stake FROM rejected`
+        : await q`WITH rejected AS (
+            UPDATE game_matches SET status='rejected',settled=true
+            WHERE id=${id} AND creator_id=${userId} AND status='pending' AND settled=false
+            RETURNING creator_id,opponent_id,stake
+          ), refund AS (
+            UPDATE users SET bal=users.bal+rejected.stake
+            FROM rejected WHERE users.id=rejected.creator_id
+            RETURNING users.id
+          )
+          SELECT creator_id,opponent_id,stake FROM rejected`;
+      if (!rows.length) throw new E('Запрошення вже оброблено або матч не можна скасувати');
+      const text=action==='cancel'?'Ініціатор скасував':'Запрошення відхилено';
+      const notifyUser=action==='cancel'?rows[0].opponent_id:rows[0].creator_id;
+      await inbox(q,notifyUser,'AFK Games',`${text} матч №${id}. Ставку ${Number(rows[0].stake).toLocaleString('uk-UA')} грн повернуто ініціатору.`);
+      return { ok:true, refunded:Number(rows[0].stake), cancelled:action==='cancel' };
     }
-    const rows=await q`UPDATE game_matches SET status=CASE WHEN game='guess' THEN 'choosing' ELSE 'active' END,
+    const rows=await q`WITH target AS MATERIALIZED (
+      SELECT id,stake,game FROM game_matches
+      WHERE id=${id} AND opponent_id=${userId} AND status='pending' AND settled=false
+      FOR UPDATE
+    ), debit AS (
+      UPDATE users SET bal=bal-(SELECT stake FROM target)
+      WHERE id=${userId} AND EXISTS(SELECT 1 FROM target) AND bal >= (SELECT stake FROM target)
+      RETURNING id
+    ), accepted AS (
+      UPDATE game_matches SET status=CASE WHEN game='guess' THEN 'choosing' ELSE 'active' END,
         started_at=now(),ends_at=CASE WHEN game='cookie' THEN now()+interval '60 seconds' ELSE now()+interval '15 minutes' END,
         secret_number=NULL,turn_user_id=NULL
-      WHERE id=${id} AND opponent_id=${userId} AND status='pending'
-      RETURNING creator_id,opponent_id,game,ends_at`;
-    if (!rows.length) throw new E('Запрошення вже оброблено');
-    await inbox(q,rows[0].creator_id,'AFK Games',rows[0].game==='guess'?`Матч №${id} прийнято. Обидва гравці мають таємно обрати число від 1 до 30.`:`Матч №${id} прийнято. Гра почалася!`);
-    await inbox(q,userId,'AFK Games',`Ти прийняв запрошення на матч №${id}.`);
-    return { ok:true, game:rows[0].game, choosing:rows[0].game==='guess', endsAt:rows[0].ends_at };
+      WHERE id=(SELECT id FROM target) AND status='pending' AND EXISTS(SELECT 1 FROM debit)
+      RETURNING creator_id,opponent_id,game,ends_at,stake
+    ) SELECT * FROM accepted`;
+    if (!rows.length) throw new E('Не вдалося прийняти матч. Перевір баланс: потрібна така сама ставка, як у запрошенні.');
+    const pot=Number(rows[0].stake)*2;
+    await inbox(q,rows[0].creator_id,'AFK Games',rows[0].game==='guess'?`Матч №${id} прийнято. Обидва гравці мають таємно обрати число від 1 до 30. Банк матчу: ${pot.toLocaleString('uk-UA')} грн.`:`Матч №${id} прийнято. Гра почалася! Банк матчу: ${pot.toLocaleString('uk-UA')} грн.`);
+    await inbox(q,userId,'AFK Games',`Ти прийняв запрошення на матч №${id}. Ставку ${Number(rows[0].stake).toLocaleString('uk-UA')} грн списано.`);
+    return { ok:true, game:rows[0].game, choosing:rows[0].game==='guess', endsAt:rows[0].ends_at, stake:Number(rows[0].stake), pot };
   },
 
   async matchSetSecret(userId,payload){
@@ -1054,8 +1740,8 @@ const Actions = {
 
   async matchList(userId) {
     const q = await getSql();
-    await q`UPDATE game_matches SET status='rejected' WHERE status='pending' AND created_at < now()-interval '24 hours' AND (creator_id=${userId} OR opponent_id=${userId})`;
-    const expired = await q`SELECT id FROM game_matches WHERE status='active' AND ends_at<=now() AND (creator_id=${userId} OR opponent_id=${userId})`;
+    await settleExpiredPendingMatches(q,userId);
+    const expired = await q`SELECT id FROM game_matches WHERE status IN ('choosing','active') AND ends_at<=now() AND (creator_id=${userId} OR opponent_id=${userId})`;
     for (const row of expired) await settleExpiredMatch(q,row.id);
     const rows = await q`SELECT m.*,c.nick AS creator,o.nick AS opponent,w.nick AS winner
       FROM game_matches m JOIN users c ON c.id=m.creator_id JOIN users o ON o.id=m.opponent_id
@@ -1070,7 +1756,7 @@ const Actions = {
       myScore:Number(m.creator_id)===userId?Number(m.creator_score):Number(m.opponent_score),
       otherScore:Number(m.creator_id)===userId?Number(m.opponent_score):Number(m.creator_score),
       myTurn:Number(m.turn_user_id)===userId,mySecretSet:Number(m.creator_id)===userId?m.creator_secret!==null:m.opponent_secret!==null,otherSecretSet:Number(m.creator_id)===userId?m.opponent_secret!==null:m.creator_secret!==null,endsAt:m.ends_at,
-      ended:m.status==='completed',secretFound:Boolean(m.winner_id)
+      stake:Number(m.stake||0),pot:Number(m.stake||0)*2,ended:m.status==='completed',secretFound:Boolean(m.winner_id)
     }))};
   },
 
@@ -1091,21 +1777,41 @@ const Actions = {
     const q = await getSql();
     const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
     const guess = int(payload.guess,1,30,'Введи число від 1 до 30');
-    const [game]=await q`SELECT creator_id,opponent_id,creator_secret,opponent_secret,turn_user_id,status,ends_at
-      FROM game_matches WHERE id=${id} AND game='guess' AND status='active'
-        AND ends_at>now() AND turn_user_id=${userId} AND (creator_id=${userId} OR opponent_id=${userId}) FOR UPDATE`;
+    const [game]=await q`WITH moved AS (
+      UPDATE game_matches SET
+        status=CASE WHEN (CASE WHEN creator_id=${userId} THEN opponent_secret ELSE creator_secret END)=${guess} THEN 'completed' ELSE 'active' END,
+        winner_id=CASE WHEN (CASE WHEN creator_id=${userId} THEN opponent_secret ELSE creator_secret END)=${guess} THEN ${userId} ELSE NULL END,
+        settled=CASE WHEN (CASE WHEN creator_id=${userId} THEN opponent_secret ELSE creator_secret END)=${guess} THEN true ELSE false END,
+        turn_user_id=CASE WHEN (CASE WHEN creator_id=${userId} THEN opponent_secret ELSE creator_secret END)=${guess}
+          THEN ${userId} ELSE CASE WHEN creator_id=${userId} THEN opponent_id ELSE creator_id END END
+      WHERE id=${id} AND game='guess' AND status='active'
+        AND ends_at>now() AND turn_user_id=${userId}
+        AND (creator_id=${userId} OR opponent_id=${userId})
+      RETURNING creator_id,opponent_id,creator_secret,opponent_secret,turn_user_id,winner_id,stake
+    ), accounts AS (
+      UPDATE users SET
+        bal=users.bal+CASE WHEN moved.winner_id=users.id THEN moved.stake*2 ELSE 0 END,
+        ok=users.ok+CASE WHEN moved.winner_id=users.id THEN 5 ELSE 0 END,
+        game_points=users.game_points+1
+      FROM moved
+      WHERE moved.winner_id IS NOT NULL AND users.id IN (moved.creator_id,moved.opponent_id)
+      RETURNING users.id
+    )
+    SELECT creator_id,opponent_id,turn_user_id,winner_id,stake,
+      CASE WHEN winner_id IS NOT NULL THEN 'correct'
+        WHEN ${guess} < CASE WHEN creator_id=${userId} THEN opponent_secret ELSE creator_secret END THEN 'higher'
+        ELSE 'lower' END AS hint
+    FROM moved`;
     if(!game)throw new E('Зараз не твій хід або матч уже завершено');
-    const target=Number(game.creator_id)===userId?Number(game.opponent_secret):Number(game.creator_secret);
-    const won=guess===target;
+    const won=Number(game.winner_id)===userId;
+    const stake=Number(game.stake||0),payout=won?stake*2:0;
     const nextUser=Number(game.creator_id)===userId?Number(game.opponent_id):Number(game.creator_id);
-    const [updated]=await q`UPDATE game_matches SET
-      status=${won?'completed':'active'},winner_id=${won?userId:null},settled=${won},
-      turn_user_id=${won?userId:nextUser}
-      WHERE id=${id} AND status='active' AND turn_user_id=${userId}
-      RETURNING status,turn_user_id`;
-    if(!updated)throw new E('Хід уже оброблено, онови гру');
-    if(won){await q`UPDATE users SET ok=ok+5 WHERE id=${userId}`;await q`UPDATE users SET game_points=game_points+1 WHERE id IN (${userId},${nextUser})`;await inbox(q,nextUser,'AFK Games',`Суперник вгадав твоє число у матчі №${id}. Матч завершено.`);await inbox(q,userId,'AFK Games',`🎉 Ти переміг у матчі «Вгадай число» №${id}. +5 XP.`);}
-    return {won,hint:won?'correct':guess<target?'higher':'lower',myTurn:Number(updated.turn_user_id)===userId,me:await getMe(userId)};
+    if(won){
+      await inbox(q,nextUser,'AFK Games',`Суперник вгадав твоє число у матчі №${id}. Матч завершено. Ставки виплачено переможцю.`);
+      await inbox(q,userId,'AFK Games',`🎉 Ти переміг у матчі «Вгадай число» №${id}. +5 XP та ${payout.toLocaleString('uk-UA')} грн.`);
+    }
+    return {won,hint:game.hint,
+      myTurn:Number(game.turn_user_id)===userId,stake,payout,net:won?payout-stake:null,me:await getMe(userId)};
   },
 
   async businessClaim(userId) {
@@ -1728,6 +2434,8 @@ const Actions = {
 function publicDatabaseError(error) {
   const code = error?.code;
   if (error instanceof E) return { message: error.message, status: error.status };
+  if (code === '23505' && String(error?.constraint||'').startsWith('mines_')) return { message: 'У тебе вже є активне мінне поле. Заверши його або повернися до поточного раунду.', status: 409 };
+  if (code === '23505' && String(error?.constraint||'').startsWith('blackjack_')) return { message: 'У тебе вже є незавершений блек-джек або запрошення. Заверши його перед новою грою.', status: 409 };
   if (code === '23505') return { message: 'Такий запис уже існує. Перевір нік і спробуй ще раз.', status: 409 };
   if (code === '42P01' || code === '42703') return { message: 'Структура бази даних ще не готова. Перевір останній Deploy на Netlify та повтори спробу.', status: 503 };
   if (code === '28P01' || code === '3D000' || code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ETIMEDOUT') {
@@ -1743,7 +2451,7 @@ export default async function handler(request) {
   try {
     if (request.method === 'GET') {
       await init();
-      return J({ ok: true, database: databaseKind, version: '8.2.0', vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null, pushEnabled: Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT), timezone: 'Europe/Kyiv' });
+      return J({ ok: true, database: databaseKind, version: '8.4.0', vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null, pushEnabled: Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT), timezone: 'Europe/Kyiv' });
     }
     if (request.method !== 'POST') return J({ err: 'Метод не підтримується' }, 405);
 
