@@ -13,7 +13,11 @@ self.addEventListener('push', (event) => {
     renotify: true,
     data: { url: typeof payload.url === 'string' && payload.url.startsWith('/') ? payload.url : '/' }
   };
-  event.waitUntil(self.registration.showNotification(title, options));
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const appIsVisible = windows.some(client => client.visibilityState === 'visible');
+    if (!appIsVisible) await self.registration.showNotification(title, options);
+  })());
 });
 
 self.addEventListener('notificationclick', (event) => {
