@@ -9,6 +9,6 @@ export default async function maintenance() {
   }
 }
 
-// Runs every five minutes. Election boundaries (13:10 and 14:20 Kyiv time)
-// are exact multiples of five minutes; the API computes the timezone itself.
-export const config = { schedule: '*/5 * * * *' };
+// Runs every minute so manually scheduled elections activate promptly.
+// All election times are evaluated in Europe/Kyiv, including DST changes.
+export const config = { schedule: '* * * * *' };

@@ -104,6 +104,7 @@ async function init() {
     await q`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_robbery_date text`;
     await q`ALTER TABLE users ADD COLUMN IF NOT EXISTS business_notify_seconds int NOT NULL DEFAULT 3600`;
     await q`ALTER TABLE users ADD COLUMN IF NOT EXISTS business_last_notice_at timestamptz`;
+    await q`ALTER TABLE users ADD COLUMN IF NOT EXISTS game_points bigint NOT NULL DEFAULT 0`;
 
     await q`CREATE TABLE IF NOT EXISTS sessions (
       h text PRIMARY KEY,
@@ -289,6 +290,10 @@ async function init() {
       name text NOT NULL, price bigint NOT NULL, quantity int NOT NULL DEFAULT 1 CHECK(quantity>=0),
       PRIMARY KEY(user_id,name)
     )`;
+    for (const car of D.cars || []) {
+      await q`UPDATE cars SET value=${car.value} WHERE name=${car.name} AND value IS DISTINCT FROM ${car.value}`;
+    }
+
     for (const row of D.houses || []) {
       await q`INSERT INTO house_assets(user_id,name,price,quantity)
         SELECT id,${row[0]},${row[1]},1 FROM users WHERE house=${row[0]}
@@ -406,35 +411,58 @@ async function inbox(q,userId,sender,message) {
   if (Number(userId)>0) {
     const text=String(message).slice(0,4000);
     await q`INSERT INTO inbox(user_id,sender,message) VALUES(${userId},${sender},${text})`;
-    await sendPush(q,userId,String(sender),text);
+    // The inbox row is durable and visible to the fast in-app poll. Push is best-effort;
+    // cap its wait without leaving a timer alive after a fast delivery.
+    let pushTimer;
+    try {
+      await Promise.race([sendPush(q,userId,String(sender),text),new Promise(resolve=>{pushTimer=setTimeout(resolve,250);})]);
+    } finally {
+      if(pushTimer) clearTimeout(pushTimer);
+    }
   }
 }
 async function settleBusinessIncome(q,userId) {
-  const [active]=await q`SELECT b.*,u.business_notify_seconds,u.business_last_notice_at FROM business_assets b JOIN users u ON u.id=b.user_id
-    WHERE b.user_id=${userId} AND u.biz=b.name LIMIT 1`;
-  if(!active) return 0;
-  const [due]=await q`SELECT floor(EXTRACT(EPOCH FROM (now()-${active.last_paid_at}))/3600)::int AS hours`;
-  const hours=Math.max(0,Number(due?.hours||0));
-  if(hours<1) return 0;
+  // All owned businesses accrue independently while the player is offline.
+  // The conditional UPDATE prevents duplicate credit when requests overlap.
   const [taxRow]=await q`SELECT value FROM game_state WHERE key='business_tax'`;
   const taxPercent=Math.max(0,Math.min(15,Number(taxRow?.value??5)));
-  const gross=hours*Number(active.hourly_profit);
-  const tax=Math.floor(gross*taxPercent/100);
-  const net=gross-tax;
-  const updated=await q`UPDATE business_assets SET last_paid_at=last_paid_at+(${hours}*interval '1 hour')
-    WHERE id=${active.id} AND last_paid_at=${active.last_paid_at} RETURNING id`;
-  if(!updated.length) return 0;
-  await q`UPDATE users SET bal=bal+${net} WHERE id=${userId}`;
-  if(tax>0) await q`UPDATE game_state SET value=(value::bigint+${tax})::text WHERE key='treasury'`;
-  await q`INSERT INTO business_payouts(user_id,business_name,hours,gross,tax,net) VALUES(${userId},${active.name},${hours},${gross},${tax},${net})`;
-  const notifySeconds=Math.max(0,Math.min(86400,Number(active.business_notify_seconds??3600)));
-  const lastNotice=active.business_last_notice_at?new Date(active.business_last_notice_at).getTime():0;
+  const rows=await q`WITH due AS (
+      SELECT id,last_paid_at, GREATEST(0,floor(EXTRACT(EPOCH FROM (now()-last_paid_at))/3600)::int) AS hours
+      FROM business_assets WHERE user_id=${userId}
+    ), claimed AS (
+      UPDATE business_assets b SET last_paid_at=b.last_paid_at+(d.hours*interval '1 hour')
+      FROM due d WHERE b.id=d.id AND b.user_id=${userId} AND d.hours>0 AND b.last_paid_at=d.last_paid_at
+      RETURNING b.id,b.name,b.hourly_profit
+    ), calc AS (
+      SELECT c.id,c.name,d.hours,(c.hourly_profit*d.hours)::bigint AS gross,
+        floor((c.hourly_profit*d.hours)::numeric*${taxPercent}/100)::bigint AS tax,
+        ((c.hourly_profit*d.hours)::bigint-floor((c.hourly_profit*d.hours)::numeric*${taxPercent}/100)::bigint) AS net
+      FROM claimed c JOIN due d ON d.id=c.id
+    ), credited AS (
+      UPDATE users SET bal=bal+COALESCE((SELECT sum(net) FROM calc),0)
+      WHERE id=${userId} AND EXISTS(SELECT 1 FROM calc) RETURNING id
+    ), taxed AS (
+      UPDATE game_state SET value=(value::bigint+COALESCE((SELECT sum(tax) FROM calc),0))::text
+      WHERE key='treasury' AND EXISTS(SELECT 1 FROM credited) RETURNING key
+    ), audited AS (
+      INSERT INTO business_payouts(user_id,business_name,hours,gross,tax,net)
+      SELECT ${userId},name,hours,gross,tax,net FROM calc WHERE EXISTS(SELECT 1 FROM credited)
+      RETURNING business_name,hours,gross,tax,net
+    ) SELECT business_name,hours,gross,tax,net FROM audited`;
+  if(!rows.length) return 0;
+  const totalNet=rows.reduce((sum,x)=>sum+Number(x.net),0);
+  const totalTax=rows.reduce((sum,x)=>sum+Number(x.tax),0);
+  const totalHours=rows.reduce((sum,x)=>sum+Number(x.hours),0);
+  const names=rows.map(x=>x.business_name);
+  const [prefs]=await q`SELECT business_notify_seconds,business_last_notice_at FROM users WHERE id=${userId}`;
+  const notifySeconds=Math.max(0,Math.min(86400,Number(prefs?.business_notify_seconds??3600)));
+  const lastNotice=prefs?.business_last_notice_at?new Date(prefs.business_last_notice_at).getTime():0;
   const shouldNotify=notifySeconds>0&&(!lastNotice||Date.now()-lastNotice>=notifySeconds*1000);
   if(shouldNotify){
     const touched=await q`UPDATE users SET business_last_notice_at=now() WHERE id=${userId} AND business_notify_seconds=${notifySeconds} RETURNING id`;
-    if(touched.length) await inbox(q,userId,'AFK Business',`🏢 Бізнес «${active.name}» приніс ${net.toLocaleString('uk-UA')} грн за ${hours} год. До казни: ${tax.toLocaleString('uk-UA')} грн податку (${taxPercent}%).`);
+    if(touched.length) await inbox(q,userId,'AFK Business',`Бізнеси (${names.join(', ')}) принесли ${totalNet.toLocaleString('uk-UA')} грн. Нараховано ${totalHours} бізнес-годин; до казни спрямовано ${totalTax.toLocaleString('uk-UA')} грн податку (${taxPercent}%).`);
   }
-  return net;
+  return totalNet;
 }
 async function processGarageForUser(q,userId) {
   const [u]=await q`SELECT car,garage_type,garage_checked_at FROM users WHERE id=${userId}`;
@@ -492,10 +520,18 @@ async function processBankDeadlines(q) {
 async function refreshPolitics(q) {
   const now=new Date(), local=kyivParts(now), weekKey=kyivWeekKey(now), minuteOfDay=local.hour*60+local.minute;
   const electionStart=13*60+10, electionEnd=14*60+20;
+  const [dueSchedule]=await q`UPDATE president_elections SET status='active'
+    WHERE id=(SELECT id FROM president_elections WHERE status='scheduled' AND started_at<=now() ORDER BY started_at LIMIT 1)
+    RETURNING id,reason,ends_at`;
+  if(dueSchedule){
+    const users=await q`SELECT id FROM users WHERE id>0`;
+    const label=dueSchedule.reason==='weekly'?'Щотижневі':'Запущені адміністратором';
+    for(const u of users) await inbox(q,u.id,'AFK Elections',`🗳️ Почалися вибори Президента (${label})! Перейди до розділу «Країна та вибори». Завершення: ${new Date(dueSchedule.ends_at).toLocaleTimeString('uk-UA',{hour:'2-digit',minute:'2-digit',timeZone:'Europe/Kyiv'})}.`);
+  }
   let [active]=await q`SELECT * FROM president_elections WHERE status='active' ORDER BY id DESC LIMIT 1`;
 
   // Close pre-6.0 ad-hoc elections so they cannot block the new weekly schedule.
-  if(active && active.week_key!==weekKey && local.weekday==='Mon' && minuteOfDay>=electionStart) {
+  if(active && active.reason==='weekly' && !active.week_key && local.weekday==='Mon' && minuteOfDay>=electionStart) {
     await q`UPDATE president_elections SET status='finished' WHERE id=${active.id} AND status='active'`;
     active=null;
   }
@@ -503,11 +539,11 @@ async function refreshPolitics(q) {
   if(active && (new Date(active.ends_at)<=now || (minuteOfDay>=electionEnd && active.week_key===weekKey))) {
     const tally=await q`SELECT c.user_id AS candidate_id,count(v.voter_id)::int AS votes FROM president_candidates c LEFT JOIN president_votes v ON v.election_id=c.election_id AND v.candidate_id=c.user_id WHERE c.election_id=${active.id} GROUP BY c.user_id`;
     const maxVotes=Math.max(0,...tally.map(x=>Number(x.votes)));
-    const tied=tally.filter(x=>Number(x.votes)===maxVotes);
+    const tied=maxVotes>0?tally.filter(x=>Number(x.votes)===maxVotes):[];
     const winner=tied.length?tied[randomInt(0,tied.length)]:null;
     await q`UPDATE president_elections SET status='finished',winner_id=${winner?.candidate_id||null} WHERE id=${active.id} AND status='active'`;
     await stateSet(q,'president_id',winner?.candidate_id||'');
-    await stateSet(q,'last_election_week',weekKey);
+    if(active.reason==='weekly') await stateSet(q,'last_election_week',weekKey);
     const [winnerUser]=winner?await q`SELECT nick FROM users WHERE id=${winner.candidate_id}`:[null];
     const users=await q`SELECT id FROM users WHERE id>0`;
     const resultText=winner?`🇺🇦 Вибори завершено! Президент — ${winnerUser?.nick||'кандидат'}. ${tied.length>1?'За однакової кількості голосів переможця обрала випадкова жеребкування.':''}`:'🇺🇦 Вибори завершено без голосів. Посада президента тимчасово вакантна.';
@@ -518,15 +554,12 @@ async function refreshPolitics(q) {
   // One election each Monday, Kyiv time: candidature and voting run 13:10–14:20.
   if(!active && local.weekday==='Mon' && minuteOfDay>=electionStart && minuteOfDay<electionEnd) {
     const lastWeek=await stateGet(q,'last_election_week','');
-    if(lastWeek!==weekKey) {
+    const [scheduled]=await q`SELECT id FROM president_elections WHERE status='scheduled' LIMIT 1`;
+    if(lastWeek!==weekKey&&!scheduled) {
       const secondsRemaining=(electionEnd-minuteOfDay)*60-local.second;
-      const [created]=await q`INSERT INTO president_elections(ends_at,reason,week_key) VALUES(now()+(${Math.max(1,secondsRemaining)}*interval '1 second'),'weekly',${weekKey}) ON CONFLICT DO NOTHING RETURNING id`;
-      if(created) {
-        await stateSet(q,'last_election_week',weekKey);
-        const users=await q`SELECT id FROM users WHERE id>0`;
-        for(const u of users) await inbox(q,u.id,'AFK Elections','🗳️ Почалися щотижневі вибори Президента! З 13:10 до 14:20 можна подати кандидатуру або проголосувати в розділі «Країна».');
-        [active]=await q`SELECT * FROM president_elections WHERE id=${created.id}`;
-      }
+      const [created]=await q`INSERT INTO president_elections(started_at,ends_at,reason,week_key,status)
+        VALUES(now(),now()+(${Math.max(1,secondsRemaining)}*interval '1 second'),'weekly',${weekKey},'scheduled') ON CONFLICT DO NOTHING RETURNING id`;
+      if(created) { await refreshPolitics(q); [active]=await q`SELECT * FROM president_elections WHERE id=${created.id}`; }
     }
   }
 }
@@ -549,7 +582,7 @@ async function getMe(id) {
   await processBankDeadlines(q);
   await refreshPolitics(q);
   const [u] = await q`SELECT
-    id, nick, avatar, role, bal, ok, stam, car, house, biz, bank_blocked, bank_banned, bank_ban_reason, garage_protect, garage_type, garage_checked_at, business_claim_at, custom_role_id,
+    id, nick, avatar, role, bal, ok, game_points, stam, car, house, biz, bank_blocked, bank_banned, bank_ban_reason, garage_protect, garage_type, garage_checked_at, business_claim_at, custom_role_id,
     GREATEST(0, EXTRACT(EPOCH FROM (daily_at + interval '24 hours' - now())) * 1000)::float8 AS c_daily,
     GREATEST(0, EXTRACT(EPOCH FROM (focus_at + interval '2 hours' - now())) * 1000)::float8 AS c_focus,
     GREATEST(0, EXTRACT(EPOCH FROM (focus_end - now())) * 1000)::float8 AS focus_run,
@@ -569,6 +602,7 @@ async function getMe(id) {
     isPresident,
     bal: Number(u.bal),
     ok: xp,
+    gamePoints: Number(u.game_points||0),
     level: level(xp),
     mult: multiplier(xp),
     stam: Boolean(u.stam),
@@ -622,6 +656,8 @@ async function settleExpiredMatch(q, matchId) {
     RETURNING id,game,creator_id,opponent_id,winner_id,creator_score,opponent_score
   ), reward AS (
     UPDATE users SET ok=ok+5 WHERE id=(SELECT winner_id FROM done) RETURNING id
+  ), points AS (
+    UPDATE users SET game_points=game_points+1 WHERE id IN (SELECT creator_id FROM done UNION SELECT opponent_id FROM done) RETURNING id
   ) SELECT * FROM done`;
   const row=rows[0];
   if(row){
@@ -771,8 +807,7 @@ const Actions = {
       SELECT id, ${vehicle.name}, ${vehicle.value}, false FROM payment
       RETURNING id`;
     if (!inserted.length) throw new E('Недостатньо грошей або цей автомобіль уже є у твоєму гаражі');
-    await inbox(q,userId,'AFK Garage',`🚘 Придбано автомобіль «${vehicle.name}» за ${vehicle.value.toLocaleString('uk-UA')} грн.`);
-    return { me: await getMe(userId) };
+    return { purchased:{type:'car',name:vehicle.name,price:vehicle.value}, me: await getMe(userId) };
   },
 
   async selectCar(userId, payload) {
@@ -800,8 +835,7 @@ const Actions = {
         ON CONFLICT(user_id,name) DO UPDATE SET quantity=house_assets.quantity+1
         RETURNING quantity`;
       if(!purchased) throw new E('Недостатньо коштів');
-      await inbox(q,userId,'AFK Property',`🏠 Придбано нерухомість «${item[0]}» за ${item[1].toLocaleString('uk-UA')} грн.`);
-      return {me:await getMe(userId)};
+      return {purchased:{type:'house',name:item[0],price:item[1]},me:await getMe(userId)};
     }
     const item = D.biz.find(row => row[0] === payload.n);
     if (!item) throw new E('Бізнес не знайдено');
@@ -814,8 +848,7 @@ const Actions = {
       SELECT id,${item[0]},${item[1]},${item[2]},now(),now() FROM debit RETURNING id`;
     if(!created) throw new E('Недостатньо коштів або цей бізнес уже придбаний');
     await q`UPDATE users SET biz=${item[0]} WHERE id=${userId} AND biz IS NULL`;
-    await inbox(q,userId,'AFK Business',`🏢 Придбано бізнес «${item[0]}» за ${item[1].toLocaleString('uk-UA')} грн. Погодинний дохід: ${item[2].toLocaleString('uk-UA')} грн/год до податку.`);
-    return {me:await getMe(userId)};
+    return {purchased:{type:'business',name:item[0],price:item[1],hourlyProfit:item[2]},me:await getMe(userId)};
   },
 
   async houseActivate(userId,payload){
@@ -897,7 +930,6 @@ const Actions = {
     ) INSERT INTO cars(user_id,name,value,jackpot)
       SELECT id,${item.car},${item.vehicle.value},false FROM debit RETURNING id`;
     if(!inserted.length) throw new E('Недостатньо коштів або цей автомобіль уже придбаний');
-    await inbox(q,userId,'AFK Garage',`📦 Комплект «${item.name}» придбано. Гарантоване авто: ${item.car}. Жодного випадкового результату.`);
     return {car:item.car,case:{id:item.id,name:item.name,rarity:item.rarity,art:item.art,price:item.price,car:item.car,carValue:item.vehicle.value},me:await getMe(userId)};
   },
 
@@ -927,6 +959,7 @@ const Actions = {
     if(!row) throw new E('Раунд завершено, час вийшов або число поза діапазоном. Почни новий раунд.');
     if(row.solved) await q`UPDATE users SET ok=ok+${Number(row.xp_reward)} WHERE id=${userId}`;
     const finished=Boolean(row.completed_at);
+    if(finished) await q`UPDATE users SET game_points=game_points+1 WHERE id=${userId}`;
     return {correct:Boolean(row.solved),hint:row.solved?'correct':finished?'finished':guess<Number(row.answer)?'higher':'lower',
       attempts:Number(row.attempts),maxAttempts:Number(row.max_attempts),rangeMax:Number(row.range_max),
       answer:finished?Number(row.answer):null,xp:row.solved?Number(row.xp_reward):0,finished,me:await getMe(userId)};
@@ -954,7 +987,8 @@ const Actions = {
     if(!challenge) throw new E('Кидок уже використано або час вийшов');
     const meta=typeof challenge.metadata==='string'?JSON.parse(challenge.metadata||'{}'):(challenge.metadata||{});
     const correct=String(meta.prediction)===String(challenge.answer);
-    const points=0;
+    const points=1;
+    await q`UPDATE users SET game_points=game_points+1 WHERE id=${userId}`;
     return {correct,points,result:{side:challenge.answer,prediction:meta.prediction},me:await getMe(userId)};
   },
   async matchCreate(userId, payload) {
@@ -1028,7 +1062,8 @@ const Actions = {
       LEFT JOIN users w ON w.id=m.winner_id
       WHERE (m.creator_id=${userId} OR m.opponent_id=${userId})
       ORDER BY m.created_at DESC LIMIT 30`;
-    return { me: await getMe(userId), matches:rows.map(m=>({
+    const [wallet]=await q`SELECT bal,ok,game_points FROM users WHERE id=${userId}`;
+    return { wallet:{bal:Number(wallet?.bal||0),ok:Number(wallet?.ok||0),gamePoints:Number(wallet?.game_points||0)}, matches:rows.map(m=>({
       id:m.id,game:m.game,status:m.status,creator:m.creator,opponent:m.opponent,winner:m.winner,
       incoming:Number(m.opponent_id)===userId,creatorMe:Number(m.creator_id)===userId,
       creatorScore:Number(m.creator_score),opponentScore:Number(m.opponent_score),
@@ -1042,9 +1077,10 @@ const Actions = {
   async cookieTap(userId, payload) {
     const q = await getSql();
     const id = int(payload.id,1,2_000_000_000,'Матч не знайдено');
+    const count=int(payload.count??1,1,50,'Некоректна кількість кліків');
     const rows=await q`UPDATE game_matches SET
-        creator_score=creator_score+CASE WHEN creator_id=${userId} THEN 1 ELSE 0 END,
-        opponent_score=opponent_score+CASE WHEN opponent_id=${userId} THEN 1 ELSE 0 END
+        creator_score=creator_score+CASE WHEN creator_id=${userId} THEN ${count} ELSE 0 END,
+        opponent_score=opponent_score+CASE WHEN opponent_id=${userId} THEN ${count} ELSE 0 END
       WHERE id=${id} AND status='active' AND ends_at>now() AND (creator_id=${userId} OR opponent_id=${userId})
       RETURNING creator_score,opponent_score`;
     if(!rows.length) throw new E('Матч завершено або ти не є його учасником');
@@ -1068,7 +1104,7 @@ const Actions = {
       WHERE id=${id} AND status='active' AND turn_user_id=${userId}
       RETURNING status,turn_user_id`;
     if(!updated)throw new E('Хід уже оброблено, онови гру');
-    if(won){await q`UPDATE users SET ok=ok+5 WHERE id=${userId}`;await inbox(q,nextUser,'AFK Games',`Суперник вгадав твоє число у матчі №${id}. Матч завершено.`);await inbox(q,userId,'AFK Games',`🎉 Ти переміг у матчі «Вгадай число» №${id}. +5 XP.`);}
+    if(won){await q`UPDATE users SET ok=ok+5 WHERE id=${userId}`;await q`UPDATE users SET game_points=game_points+1 WHERE id IN (${userId},${nextUser})`;await inbox(q,nextUser,'AFK Games',`Суперник вгадав твоє число у матчі №${id}. Матч завершено.`);await inbox(q,userId,'AFK Games',`🎉 Ти переміг у матчі «Вгадай число» №${id}. +5 XP.`);}
     return {won,hint:won?'correct':guess<target?'higher':'lower',myTurn:Number(updated.turn_user_id)===userId,me:await getMe(userId)};
   },
 
@@ -1091,8 +1127,7 @@ const Actions = {
       SELECT id,${name},${item[1]},${item[2]},now(),now() FROM debit RETURNING id`;
     if(!created) throw new E('Недостатньо коштів або бізнес уже придбаний');
     await q`UPDATE users SET biz=${name} WHERE id=${userId} AND biz IS NULL`;
-    await inbox(q,userId,'AFK Business',`🏢 Придбано бізнес «${name}» за ${item[1].toLocaleString('uk-UA')} грн. Погодинний дохід: ${item[2].toLocaleString('uk-UA')} грн/год до податку.`);
-    return {me:await getMe(userId)};
+    return {purchased:{type:'business',name,price:item[1],hourlyProfit:item[2]},me:await getMe(userId)};
   },
   async businessActivate(userId,payload) {
     const q=await getSql(); const name=String(payload.name||'');
@@ -1100,8 +1135,7 @@ const Actions = {
     if(!asset) throw new E('Цей бізнес не належить тобі');
     await settleBusinessIncome(q,userId);
     await q`UPDATE users SET biz=${name} WHERE id=${userId}`;
-    await q`UPDATE business_assets SET last_paid_at=now() WHERE id=${asset.id}`;
-    await inbox(q,userId,'AFK Business',`⚙️ Активним обрано бізнес «${name}». Його погодинний дохід тепер надходитиме на баланс.`);
+    await inbox(q,userId,'AFK Business',`Активним у профілі обрано бізнес «${name}». Всі бізнеси твого портфеля продовжують приносити погодинний дохід.`);
     return {me:await getMe(userId)};
   },
   async businessStats(userId) {
@@ -1109,7 +1143,7 @@ const Actions = {
     const [u]=await q`SELECT biz,business_notify_seconds FROM users WHERE id=${userId}`;
     const rows=await q`SELECT name,price,hourly_profit,purchased_at,last_paid_at FROM business_assets WHERE user_id=${userId} ORDER BY purchased_at`;
     const tax=Number(await stateGet(q,'business_tax','5'));
-    return {income,active:u?.biz||null,tax,notifySeconds:Number(u?.business_notify_seconds??3600),assets:rows.map(x=>({name:x.name,price:Number(x.price),hourlyProfit:Number(x.hourly_profit),lastPaidAt:x.last_paid_at,active:x.name===u?.biz})),catalog:D.biz.map(x=>({name:x[0],price:x[1],hourlyProfit:x[2]})),me:await getMe(userId)};
+    return {income,active:u?.biz||null,tax,notifySeconds:Number(u?.business_notify_seconds??3600),assets:rows.map(x=>({name:x.name,price:Number(x.price),hourlyProfit:Number(x.hourly_profit),lastPaidAt:x.last_paid_at,active:x.name===u?.biz})),catalog:D.biz.map(x=>({name:x[0],price:x[1],hourlyProfit:x[2],category:x[3]||'Інше'})).sort((a,b)=>a.price-b.price),me:await getMe(userId)};
   },
   async businessNotifySet(userId,payload) {
     const q=await getSql();
@@ -1155,6 +1189,7 @@ const Actions = {
     const q=await getSql(); await refreshPolitics(q);
     const president=Number(await stateGet(q,'president_id','0'))||null;
     const [election]=await q`SELECT id,started_at,ends_at,status,week_key FROM president_elections WHERE status='active' ORDER BY id DESC LIMIT 1`;
+    const [scheduledElection]=await q`SELECT id,started_at,ends_at FROM president_elections WHERE status='scheduled' ORDER BY started_at LIMIT 1`;
     let candidates=[];
     if(election) candidates=await q`SELECT u.id,u.nick,u.avatar,u.ok,c.party_name,c.party_description,c.fee,c.applied_at,count(v.voter_id)::int AS votes
       FROM president_candidates c JOIN users u ON u.id=c.user_id
@@ -1169,7 +1204,7 @@ const Actions = {
     const [me]=await q`SELECT ok FROM users WHERE id=${userId}`; const lvl=level(Number(me?.ok||0));
     const p=kyivParts();
     const [withdrawLimit]=president?await q`SELECT last_at + interval '48 hours' AS ready_at FROM president_limits WHERE user_id=${president} AND action='withdraw'`:[null];
-    return {withdrawReadyAt:withdrawLimit?.ready_at||null,treasury:Number(await stateGet(q,'treasury','100000000')),tax:Number(await stateGet(q,'business_tax','5')),president,presidentNick:pres?.nick||null,presidentAvatar:pres?.avatar||null,
+    return {withdrawReadyAt:withdrawLimit?.ready_at||null,scheduledElection:scheduledElection?{id:Number(scheduledElection.id),startsAt:scheduledElection.started_at,endsAt:scheduledElection.ends_at}:null,treasury:Number(await stateGet(q,'treasury','100000000')),tax:Number(await stateGet(q,'business_tax','5')),president,presidentNick:pres?.nick||null,presidentAvatar:pres?.avatar||null,
       election:election?{id:election.id,startedAt:election.started_at,endsAt:election.ends_at,weekKey:election.week_key,candidates:candidates.map(x=>({id:Number(x.id),nick:x.nick,avatar:x.avatar,level:level(Number(x.ok)),partyName:x.party_name,partyDescription:x.party_description,fee:Number(x.fee),votes:Number(x.votes)})),myCandidate:myCandidate[0]||null,myVote:Number(myVote[0]?.candidate_id||0)||null}:null,
       candidacyFee:100000*lvl,level:lvl,kyivNow:p,motion:motion?{id:motion.id,votes:motionVotes,presidentId:motion.president_id}:null,me:await getMe(userId)};
   },
@@ -1388,7 +1423,7 @@ const Actions = {
       if(already) throw new E('Цей автомобіль уже виставлений на ринок');
       const [row]=await q`INSERT INTO market_listings(seller_id,asset_type,asset_key,car_id,price)
         VALUES(${userId},'car',${car.name},${carId},${price}) RETURNING id`;
-      await inbox(q,userId,'AFK Market',`📣 Автомобіль «${car.name}» виставлено на ринок за ${price.toLocaleString('uk-UA')} грн.`);
+      await inbox(q,userId,'AFK Market',`Автомобіль «${car.name}» виставлено на ринок за ${price.toLocaleString('uk-UA')} грн.`);
       return {id:row.id};
     }
     const key=String(payload.assetKey||'').trim();
@@ -1407,7 +1442,7 @@ const Actions = {
     ) SELECT listing.id,reserved.quantity FROM listing,reserved`;
     if(!row) throw new E('Цієї нерухомості немає в інвентарі або її вже виставили');
     if(user.house===key && Number(row.quantity)===0) await q`UPDATE users SET house=NULL WHERE id=${userId} AND house=${key}`;
-    await inbox(q,userId,'AFK Market',`📣 Нерухомість «${key}» виставлено на ринок за ${price.toLocaleString('uk-UA')} грн.`);
+    await inbox(q,userId,'AFK Market',`Нерухомість «${key}» виставлено на ринок за ${price.toLocaleString('uk-UA')} грн.`);
     return {id:row.id};
   },
 
@@ -1450,8 +1485,31 @@ const Actions = {
     const [buyer]=await q`SELECT nick FROM users WHERE id=${userId}`;
     const [seller]=await q`SELECT nick FROM users WHERE id=${listing.seller_id}`;
     const assetType=listing.asset_type==='car'?'автомобіль':'нерухомість';
-    await inbox(q,listing.seller_id,'AFK Market',`🛒 ${buyer.nick} придбав твоє оголошення «${listing.asset_key}» (${assetType}) за ${Number(listing.price).toLocaleString('uk-UA')} грн.`);
-    await inbox(q,userId,'AFK Market',`✅ Ти придбав «${listing.asset_key}» у гравця ${seller.nick} за ${Number(listing.price).toLocaleString('uk-UA')} грн.`);
+    await inbox(q,listing.seller_id,'AFK Market',`${buyer.nick} придбав твоє оголошення «${listing.asset_key}» (${assetType}) за ${Number(listing.price).toLocaleString('uk-UA')} грн.`);
+    return {purchased:{type:listing.asset_type,name:listing.asset_key,price:Number(listing.price),seller:seller.nick},me:await getMe(userId)};
+  },
+
+  async marketCancel(userId,payload) {
+    const q=await getSql();
+    const id=int(payload.id,1,2_000_000_000,'Оголошення не знайдено');
+    const [listing]=await q`SELECT asset_type,asset_key FROM market_listings WHERE id=${id} AND seller_id=${userId} AND status='active'`;
+    if(!listing) throw new E('Оголошення не знайдено або його вже закрито');
+    if(listing.asset_type==='house'){
+      const price=D.houses.find(x=>x[0]===listing.asset_key)?.[1]||0;
+      const [result]=await q`WITH closed AS (
+        UPDATE market_listings SET status='cancelled' WHERE id=${id} AND seller_id=${userId} AND status='active' RETURNING asset_key
+      ), restored AS (
+        INSERT INTO house_assets(user_id,name,price,quantity)
+        SELECT ${userId},asset_key,${price},1 FROM closed
+        ON CONFLICT(user_id,name) DO UPDATE SET quantity=house_assets.quantity+1
+        RETURNING name
+      ) SELECT count(*)::int AS n FROM restored`;
+      if(!result?.n)throw new E('Оголошення вже закрито');
+      await q`UPDATE users SET house=COALESCE(house,${listing.asset_key}) WHERE id=${userId}`;
+    }else{
+      const [result]=await q`UPDATE market_listings SET status='cancelled' WHERE id=${id} AND seller_id=${userId} AND status='active' RETURNING id`;
+      if(!result)throw new E('Оголошення вже закрито');
+    }
     return {me:await getMe(userId)};
   },
 
@@ -1566,14 +1624,20 @@ const Actions = {
     const q = await getSql();
     const [actor] = await q`SELECT nick, role FROM users WHERE id = ${userId}`;
     if (!actor || !isAdmin(actor.role)) throw new E('🔒 Лише для адміністраторів', 403);
+    if(payload.op==='players'){
+      const players=await q`SELECT id,nick,avatar,role,bal,ok FROM users WHERE id>0 ORDER BY id LIMIT 100`;
+      return {players:players.map(x=>({id:Number(x.id),nick:x.nick,avatar:x.avatar,role:x.role,bal:Number(x.bal),level:level(Number(x.ok))})),vehicles:CAR_CATALOG.map(x=>({name:x.name,value:x.value})),businesses:D.biz.map(x=>({name:x[0],price:x[1],hourlyProfit:x[2],category:x[3]||'Інше'}))};
+    }
     if (payload.op === 'log') {
-      const log = await q`SELECT at, admin, text FROM alog ORDER BY id DESC LIMIT 20`;
+      const log = await q`SELECT at, admin, text FROM alog ORDER BY id DESC LIMIT 30`;
       return { log };
     }
 
+    const noTarget = ['promo_create','msg_broadcast','election_start'].includes(payload.op);
+    const targetId=payload.playerId?int(payload.playerId,1,2_000_000_000,'Обери гравця зі списку'):0;
     const targetNick = String(payload.nick || '').trim().toLocaleLowerCase('uk-UA');
-    const [target] = ['promo_create','msg_broadcast'].includes(payload.op) ? [null] : await q`SELECT id, nick, role FROM users WHERE nick_lc = ${targetNick}`;
-    if (!['promo_create','msg_broadcast'].includes(payload.op) && !target) throw new E('Гравця не знайдено');
+    const [target] = noTarget ? [null] : targetId ? await q`SELECT id,nick,role FROM users WHERE id=${targetId}` : await q`SELECT id,nick,role FROM users WHERE nick_lc=${targetNick}`;
+    if (!noTarget && !target) throw new E('Обери гравця зі списку');
     if (target?.role === 'owner' && actor.role !== 'owner') throw new E('Власник має найвищі права', 403);
 
     let logText = '';
@@ -1632,6 +1696,26 @@ const Actions = {
       const nextRole = payload.op === 'giveadmin' ? 'admin' : payload.op === 'takeadmin' ? 'user' : (payload.enabled===true || payload.n===1 || payload.n==='1' ? 'admin' : 'user');
       await q`UPDATE users SET role = ${nextRole} WHERE id = ${target.id}`;
       logText = `${payload.op} ${target.nick} → ${nextRole}`;
+    } else if(payload.op==='assign_president') {
+      if(actor.role!=='owner') throw new E('Призначати президента без виборів може лише власник',403);
+      await q`UPDATE president_elections SET status='cancelled' WHERE status IN ('active','scheduled')`;
+      await stateSet(q,'president_id',String(target.id));
+      const users=await q`SELECT id FROM users WHERE id>0`;
+      for(const u of users) await inbox(q,u.id,'AFK Elections',`🏛️ ${target.nick} призначено Президентом рішенням власника. Відкрий розділ «Країна та вибори», щоб переглянути державний кабінет.`);
+      logText=`assign_president ${target.nick}`;
+    } else if(payload.op==='election_start') {
+      if(actor.role!=='owner') throw new E('Запускати позапланові вибори може лише власник',403);
+      const [busy]=await q`SELECT id FROM president_elections WHERE status IN ('active','scheduled') LIMIT 1`;
+      if(busy) throw new E('Вже є активні або заплановані вибори. Спочатку заверши їх.');
+      const start=payload.when==='now'?new Date():new Date(String(payload.startsAt||''));
+      if(!Number.isFinite(start.getTime())) throw new E('Вкажи коректну дату й час');
+      const delta=start.getTime()-Date.now();
+      if(delta < -5000 || delta > 30*24*60*60*1000) throw new E('Вибори можна запустити зараз або запланувати в межах наступних 30 днів');
+      const ends=new Date(start.getTime()+70*60*1000);
+      const [created]=await q`INSERT INTO president_elections(started_at,ends_at,reason,status) VALUES(${start.toISOString()},${ends.toISOString()},'admin','scheduled') RETURNING id`;
+      if(delta<=5000) await refreshPolitics(q);
+      else { const users=await q`SELECT id FROM users WHERE id>0`; for(const u of users) await inbox(q,u.id,'AFK Elections',`🗓️ Власник запланував президентські вибори на ${start.toLocaleString('uk-UA',{timeZone:'Europe/Kyiv'})} за Києвом. Тривалість — 70 хвилин.`); }
+      logText=`election_start #${created.id} ${start.toISOString()}`;
     } else {
       throw new E('Невідома адміністративна дія');
     }
@@ -1659,7 +1743,7 @@ export default async function handler(request) {
   try {
     if (request.method === 'GET') {
       await init();
-      return J({ ok: true, database: databaseKind, version: '7.1.0', vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null, pushEnabled: Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT), timezone: 'Europe/Kyiv' });
+      return J({ ok: true, database: databaseKind, version: '8.2.0', vapidPublicKey: process.env.VAPID_PUBLIC_KEY || null, pushEnabled: Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY && process.env.VAPID_SUBJECT), timezone: 'Europe/Kyiv' });
     }
     if (request.method !== 'POST') return J({ err: 'Метод не підтримується' }, 405);
 
