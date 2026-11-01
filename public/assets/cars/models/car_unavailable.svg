@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 440" role="img" aria-labelledby="title desc">
+  <title id="title">Зображення автомобіля</title><desc id="desc">Фотографію цієї моделі буде додано пізніше</desc>
+  <defs><linearGradient id="bg" x2="0" y2="1"><stop stop-color="#242a36"/><stop offset="1" stop-color="#10141c"/></linearGradient><linearGradient id="car" x2="0" y2="1"><stop stop-color="#dbe3ef"/><stop offset="1" stop-color="#687587"/></linearGradient></defs>
+  <rect width="720" height="440" rx="26" fill="url(#bg)"/><ellipse cx="356" cy="316" rx="220" ry="27" fill="#05070b" opacity=".65"/>
+  <path d="M142 286l30-67c10-23 31-37 58-40l69-8 53-55c17-18 39-28 64-28h74c31 0 57 14 75 39l39 55 46 17c22 8 36 28 36 51v43c0 14-11 25-25 25H154c-19 0-28-14-12-32z" fill="url(#car)" stroke="#f0f4fa" stroke-width="5"/>
+  <path d="M315 171l51-51c12-12 27-18 45-18h74c22 0 42 10 55 28l31 41z" fill="#172638" stroke="#b7c3d3" stroke-width="4"/><path d="M411 108v63m91-44 25 44" stroke="#8192a8" stroke-width="4"/>
+  <path d="M172 243h75m322 0h75" stroke="#f7f9fc" stroke-width="9" stroke-linecap="round"/><path d="M150 281h420" stroke="#4b5667" stroke-width="8"/>
+  <circle cx="245" cy="302" r="47" fill="#10151d" stroke="#aeb8c7" stroke-width="10"/><circle cx="245" cy="302" r="21" fill="#758296"/><circle cx="541" cy="302" r="47" fill="#10151d" stroke="#aeb8c7" stroke-width="10"/><circle cx="541" cy="302" r="21" fill="#758296"/>
+  <text x="360" y="386" fill="#d3dbea" text-anchor="middle" font-family="Arial,sans-serif" font-size="22" font-weight="700">ФОТО МОДЕЛІ БУДЕ ДОДАНО ПІЗНІШЕ</text>
+</svg>
